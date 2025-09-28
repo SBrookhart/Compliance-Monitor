@@ -267,4 +267,9 @@ export default function Home() {
 
       <hr style={{ margin: "24px 0", borderColor: "#e5e7eb" }} />
       <small style={{ color: "#6b7280" }}>
-        Demo only. For production compli
+        Demo only. For production compliance, add vetted lists, case management,
+        and audit trails.
+      </small>
+    </div>
+  );
+}

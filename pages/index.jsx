@@ -20,10 +20,10 @@ const WATCHLIST = [
 const BLOCK_WINDOW = 3600;
 // =====================
 
-// Public RPC (no API key)
+// Public RPC (reliable endpoint)
 const client = createPublicClient({
   chain: base,
-  transport: http("https://mainnet.base.org"),
+  transport: http("https://rpc.ankr.com/base"),
 });
 
 // ERC-20 Transfer event signature
@@ -33,7 +33,8 @@ const TRANSFER_EVENT = parseAbiItem(
 
 async function fetchRecentTransfers() {
   const latest = await client.getBlockNumber();
-  const fromBlock = latest > BigInt(BLOCK_WINDOW) ? latest - BigInt(BLOCK_WINDOW) : 0n;
+  const fromBlock =
+    latest > BigInt(BLOCK_WINDOW) ? latest - BigInt(BLOCK_WINDOW) : 0n;
 
   // 1) Fetch logs for Transfer events
   const logs = await client.getLogs({
@@ -45,7 +46,7 @@ async function fetchRecentTransfers() {
 
   if (!logs.length) return [];
 
-  // 2) Fetch timestamps per unique block (batched by hash)
+  // 2) Fetch timestamps per unique block (batch fetch by hash)
   const uniqueBlocks = [...new Set(logs.map((l) => l.blockHash))];
   const blockMap = new Map();
   await Promise.all(
@@ -93,7 +94,13 @@ export default function Home() {
       setErr("");
       setDiag("");
       try {
+        // Add a 10s timeout so we don’t hang forever
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 10000);
+
         const data = await fetchRecentTransfers();
+        clearTimeout(timeout);
+
         setRows(data);
         setDiag(
           `Scanned ~${BLOCK_WINDOW.toLocaleString()} recent blocks on Base (≈ ${(
@@ -102,7 +109,8 @@ export default function Home() {
           ).toFixed(1)} minutes).`
         );
       } catch (e) {
-        setErr(e.message || String(e));
+        console.error("RPC error:", e);
+        setErr(e.message || "Failed to fetch logs.");
       } finally {
         setLoading(false);
       }

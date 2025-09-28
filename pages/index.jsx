@@ -8,23 +8,35 @@ import {
 } from "viem";
 import { base } from "viem/chains";
 
-// ====== Config ======
+// ====== Config you can tweak ======
 const USDC_CONTRACT = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"; // USDC on Base
 const USDC_DECIMALS = 6;
 const HIGH_VALUE_USD = 10000; // flag threshold
 const WATCHLIST = [
+  // Put full 0x addresses you want to monitor
   "0x1111111111111111111111111111111111111111",
   "0x2222222222222222222222222222222222222222",
 ];
-// Base ~2s blocks → 3600 blocks ≈ ~2 hours
+// Base ~2s blocks → 3600 blocks ≈ ~2 hours. Increase for a wider window.
 const BLOCK_WINDOW = 3600;
-// =====================
+// ==================================
 
-// Public RPC (reliable endpoint)
-const client = createPublicClient({
-  chain: base,
-  transport: http("https://rpc.ankr.com/base"),
-});
+// Your Ankr RPC URL comes from Vercel env:
+// NEXT_PUBLIC_ANKR_BASE_RPC = https://rpc.ankr.com/base/<YOUR_KEY>
+const ANKR_RPC = process.env.NEXT_PUBLIC_ANKR_BASE_RPC;
+
+// Build a client lazily so we can show nice errors if env var is missing
+function getClient() {
+  if (!ANKR_RPC || !/^https?:\/\//i.test(ANKR_RPC)) {
+    throw new Error(
+      "Missing NEXT_PUBLIC_ANKR_BASE_RPC. In Vercel, set it to your Ankr URL (e.g., https://rpc.ankr.com/base/XXXX)."
+    );
+  }
+  return createPublicClient({
+    chain: base,
+    transport: http(ANKR_RPC, { batch: true }),
+  });
+}
 
 // ERC-20 Transfer event signature
 const TRANSFER_EVENT = parseAbiItem(
@@ -32,11 +44,14 @@ const TRANSFER_EVENT = parseAbiItem(
 );
 
 async function fetchRecentTransfers() {
+  const client = getClient();
+
+  // 1) Figure out the recent block range
   const latest = await client.getBlockNumber();
   const fromBlock =
     latest > BigInt(BLOCK_WINDOW) ? latest - BigInt(BLOCK_WINDOW) : 0n;
 
-  // 1) Fetch logs for Transfer events
+  // 2) Get Transfer logs for USDC in that range
   const logs = await client.getLogs({
     address: getAddress(USDC_CONTRACT),
     event: TRANSFER_EVENT,
@@ -46,7 +61,7 @@ async function fetchRecentTransfers() {
 
   if (!logs.length) return [];
 
-  // 2) Fetch timestamps per unique block (batch fetch by hash)
+  // 3) Fetch timestamps for unique blocks (batch by block hash)
   const uniqueBlocks = [...new Set(logs.map((l) => l.blockHash))];
   const blockMap = new Map();
   await Promise.all(
@@ -56,7 +71,7 @@ async function fetchRecentTransfers() {
     })
   );
 
-  // 3) Shape rows
+  // 4) Shape rows
   const wl = WATCHLIST.map((a) => a.toLowerCase());
   const rows = logs.map((l) => {
     const from = l.args.from;
@@ -94,12 +109,12 @@ export default function Home() {
       setErr("");
       setDiag("");
       try {
-        // Add a 10s timeout so we don’t hang forever
-        const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 10000);
+        // Soft timeout so we don’t spin forever if the RPC is unreachable
+        const abort = new AbortController();
+        const timer = setTimeout(() => abort.abort(), 15000);
 
         const data = await fetchRecentTransfers();
-        clearTimeout(timeout);
+        clearTimeout(timer);
 
         setRows(data);
         setDiag(
@@ -109,8 +124,14 @@ export default function Home() {
           ).toFixed(1)} minutes).`
         );
       } catch (e) {
+        // Surface useful provider errors (auth, CORS, etc.)
         console.error("RPC error:", e);
-        setErr(e.message || "Failed to fetch logs.");
+        setErr(
+          String(e?.message || e) +
+            (ANKR_RPC
+              ? ""
+              : " | Hint: set NEXT_PUBLIC_ANKR_BASE_RPC in Vercel to your Ankr URL.")
+        );
       } finally {
         setLoading(false);
       }
@@ -145,9 +166,16 @@ export default function Home() {
             border: "1px solid #FECACA",
             borderRadius: 8,
             marginBottom: 12,
+            whiteSpace: "pre-wrap",
           }}
         >
           {err}
+          {ANKR_RPC ? null : (
+            <>
+              {"\n"}
+              Example value: https://rpc.ankr.com/base/YOUR_KEY
+            </>
+          )}
         </div>
       ) : null}
 
@@ -217,34 +245,4 @@ export default function Home() {
                           High&nbsp;Value&nbsp;
                         </span>
                       ) : null}
-                      {tx.flaggedWatchlist ? (
-                        <span style={{ color: "#b45309", fontWeight: 700 }}>
-                          Watchlist
-                        </span>
-                      ) : null}
-                      {!tx.flaggedLarge && !tx.flaggedWatchlist ? (
-                        <span style={{ color: "#6b7280" }}>—</span>
-                      ) : null}
-                    </td>
-                  </tr>
-                ))
-              ) : (
-                <tr>
-                  <td colSpan={6} style={{ padding: 12, color: "#6b7280" }}>
-                    No transfers in the scanned window. Try widening it.
-                  </td>
-                </tr>
-              )}
-            </tbody>
-          </table>
-        </div>
-      )}
-
-      <hr style={{ margin: "24px 0", borderColor: "#e5e7eb" }} />
-      <small style={{ color: "#6b7280" }}>
-        Demo only. For production compliance, add vetted lists, case management,
-        and audit trails.
-      </small>
-    </div>
-  );
-}
+                      {

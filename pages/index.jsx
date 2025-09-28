@@ -109,13 +109,11 @@ export default function Home() {
       setErr("");
       setDiag("");
       try {
-        // Soft timeout so we don’t spin forever if the RPC is unreachable
-        const abort = new AbortController();
-        const timer = setTimeout(() => abort.abort(), 15000);
-
-        const data = await fetchRecentTransfers();
-        clearTimeout(timer);
-
+        // Soft timeout guard (if your RPC is unreachable)
+        const timeout = new Promise((_, rej) =>
+          setTimeout(() => rej(new Error("RPC timeout after 15s")), 15000)
+        );
+        const data = await Promise.race([fetchRecentTransfers(), timeout]);
         setRows(data);
         setDiag(
           `Scanned ~${BLOCK_WINDOW.toLocaleString()} recent blocks on Base (≈ ${(
@@ -124,7 +122,6 @@ export default function Home() {
           ).toFixed(1)} minutes).`
         );
       } catch (e) {
-        // Surface useful provider errors (auth, CORS, etc.)
         console.error("RPC error:", e);
         setErr(
           String(e?.message || e) +
@@ -245,4 +242,29 @@ export default function Home() {
                           High&nbsp;Value&nbsp;
                         </span>
                       ) : null}
-                      {
+                      {tx.flaggedWatchlist ? (
+                        <span style={{ color: "#b45309", fontWeight: 700 }}>
+                          Watchlist
+                        </span>
+                      ) : null}
+                      {!tx.flaggedLarge && !tx.flaggedWatchlist ? (
+                        <span style={{ color: "#6b7280" }}>—</span>
+                      ) : null}
+                    </td>
+                  </tr>
+                ))
+              ) : (
+                <tr>
+                  <td colSpan={6} style={{ padding: 12, color: "#6b7280" }}>
+                    No transfers in the scanned window. Try widening it.
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <hr style={{ margin: "24px 0", borderColor: "#e5e7eb" }} />
+      <small style={{ color: "#6b7280" }}>
+        Demo only. For production compli

@@ -1,6 +1,9 @@
 import { useEffect, useMemo, useState } from "react";
 import { formatUnits } from "viem";
 
+// === Constants ===
+const API_KEY = process.env.NEXT_PUBLIC_BASESCAN_KEY;
+
 // USDC on Base (official)
 const USDC_CONTRACT = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
 const USDC_DECIMALS = 6;
@@ -9,133 +12,149 @@ const USDC_DECIMALS = 6;
 const TRANSFER_TOPIC =
   "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 
-// ==== Customize these ====
-const HIGH_VALUE_USD = 10000; // flag transfers >= $10,000 (USDC ~ $1)
+// Flags
+const HIGH_VALUE_USD = 10000;
 const WATCHLIST = [
-  // Put full 0x addresses here (lower/upper case OK)
   "0x1111111111111111111111111111111111111111",
   "0x2222222222222222222222222222222222222222"
 ];
-// =========================
 
-const API_KEY = process.env.NEXT_PUBLIC_BASESCAN_KEY;
+// === Helpers ===
+function toHexDec(n) {
+  // Etherscan-family getLogs accepts hex; safer than decimal.
+  const hex = Number(n).toString(16);
+  return "0x" + hex;
+}
 
-/**
- * Helper to call the BaseScan API
- */
-async function basescan(pathAndQuery) {
-  const res = await fetch(`https://api.basescan.org/api${pathAndQuery}`);
-  const data = await res.json();
-  // Etherscan-family APIs use { status: "1" | "0", message: "OK" | "NOTOK" }
+async function callBaseScan(query) {
+  const url = `https://api.basescan.org/api${query}`;
+  const res = await fetch(url);
+  let data;
+  try { data = await res.json(); } catch {
+    throw new Error("Unable to parse API response");
+  }
+  // Etherscan-family: status "1" = OK, "0" = NOTOK
   if (!data || data.status === "0") {
-    const msg = data?.message || "NOTOK";
-    throw new Error(msg);
+    throw new Error(data?.message || "NOTOK");
   }
   return data.result;
 }
 
-/**
- * Get a block number near a timestamp (seconds) using Etherscan-style API.
- * closest: "before" | "after"
- */
 async function getBlockNoByTime(tsSeconds, closest) {
   const q = `?module=block&action=getblocknobytime&timestamp=${tsSeconds}&closest=${closest}&apikey=${API_KEY}`;
-  const result = await basescan(q);
-  // result is a decimal string
-  return Number(result);
+  const result = await callBaseScan(q);
+  return Number(result); // decimal block number as string -> number
 }
 
-/**
- * Fetch recent USDC Transfer logs over a time window (e.g., last 3 hours).
- * Returns array of logs with {time, hash, from, to, amount}
- */
-async function fetchRecentTransfers(hours = 3) {
-  const now = Math.floor(Date.now() / 1000);
-  const startTs = now - hours * 3600;
+async function fetchLogsInWindow(hours) {
+  const nowSec = Math.floor(Date.now() / 1000);
+  const startSec = nowSec - hours * 3600;
 
-  // 1) Resolve time window to block numbers
-  const fromBlock = await getBlockNoByTime(startTs, "before");
-  const toBlock = await getBlockNoByTime(now, "before");
+  // Map time -> blocks; tolerate equal/out-of-order results by nudging
+  const fromBlockNum = await getBlockNoByTime(startSec, "before");
+  const toBlockNum = await getBlockNoByTime(nowSec, "before");
+  const fromBlock = Math.min(fromBlockNum, toBlockNum);
+  const toBlock = Math.max(fromBlockNum, toBlockNum);
 
-  // 2) Query logs for USDC Transfer events within block range
-  // Note: Etherscan-family expects decimal block numbers here.
-  const logsQuery =
+  const q =
     `?module=logs&action=getLogs` +
-    `&fromBlock=${fromBlock}` +
-    `&toBlock=${toBlock}` +
+    `&fromBlock=${toHexDec(fromBlock)}` +
+    `&toBlock=${toHexDec(toBlock)}` +
     `&address=${USDC_CONTRACT}` +
     `&topic0=${TRANSFER_TOPIC}` +
     `&apikey=${API_KEY}`;
 
-  const logs = await basescan(logsQuery);
+  const logs = await callBaseScan(q);
+  const lw = WATCHLIST.map(a => a.toLowerCase());
 
-  // 3) Parse logs. topics[1] and topics[2] are 32-byte indexed addresses.
-  //    'data' is the 32-byte uint256 amount.
-  const lowerWatch = WATCHLIST.map(a => a.toLowerCase());
-
-  return logs.map((log) => {
+  const rows = logs.map((log) => {
+    // topics[1] and topics[2] are 32-byte addresses (left-padded); last 40 chars = address
     const from = "0x" + log.topics[1].slice(26);
     const to = "0x" + log.topics[2].slice(26);
     const amount = Number(formatUnits(BigInt(log.data), USDC_DECIMALS));
-
     const flaggedLarge = amount >= HIGH_VALUE_USD;
     const flaggedWatchlist =
-      lowerWatch.includes(from.toLowerCase()) ||
-      lowerWatch.includes(to.toLowerCase());
+      lw.includes(from.toLowerCase()) || lw.includes(to.toLowerCase());
 
     return {
-      time: Number(log.timeStamp) * 1000, // ms
+      time: Number(log.timeStamp) * 1000,
       hash: log.transactionHash,
-      from,
-      to,
-      amount,
-      flaggedLarge,
-      flaggedWatchlist
+      from, to, amount,
+      flaggedLarge, flaggedWatchlist
     };
   });
+
+  // Newest first
+  rows.sort((a, b) => b.time - a.time);
+  return { rows, meta: { fromBlock, toBlock, hours } };
 }
 
+// Try 3h, then 6h, then 12h if needed (errors or empty)
+async function fetchWithFallbacks() {
+  const attempts = [3, 6, 12];
+  const errors = [];
+  for (const h of attempts) {
+    try {
+      const result = await fetchLogsInWindow(h);
+      if (result.rows.length > 0) return { ...result, errors };
+      errors.push(`No logs in last ${h}h (from ${result.meta.fromBlock} to ${result.meta.toBlock})`);
+    } catch (e) {
+      errors.push(`(${h}h) ${e.message || String(e)}`);
+    }
+  }
+  throw new Error(errors.join(" | "));
+}
+
+// === Component ===
 export default function Home() {
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState("");
+  const [diag, setDiag] = useState(""); // extra diagnostics
 
   useEffect(() => {
     (async () => {
       if (!API_KEY) {
-        setErr(
-          "Missing NEXT_PUBLIC_BASESCAN_KEY. Add it in Vercel → Project → Settings → Environment Variables, then redeploy."
-        );
+        setErr("Missing NEXT_PUBLIC_BASESCAN_KEY (set it in Vercel → Project → Settings → Environment Variables) and redeploy.");
         setLoading(false);
         return;
       }
+      setLoading(true);
+      setErr("");
+      setDiag("");
       try {
-        setLoading(true);
-        setErr("");
-        const txs = await fetchRecentTransfers(3); // last 3 hours
-        // Sort newest first
-        txs.sort((a, b) => b.time - a.time);
-        setRows(txs);
+        const { rows: r, meta, errors } = await fetchWithFallbacks();
+        setRows(r);
+        if (errors && errors.length) {
+          setDiag(`Recovered after: ${errors.join(" | ")}`);
+        } else {
+          setDiag(`Fetched window ~${meta.hours}h (blocks ${meta.fromBlock} → ${meta.toBlock}).`);
+        }
       } catch (e) {
-        setErr(String(e.message || e));
+        setErr(e.message || "NOTOK");
       } finally {
         setLoading(false);
       }
     })();
   }, []);
 
-  const hasData = useMemo(() => rows && rows.length > 0, [rows]);
+  const hasData = useMemo(() => rows.length > 0, [rows]);
 
   return (
     <div style={{ maxWidth: 980, margin: "40px auto", padding: 16, fontFamily: "ui-sans-serif, system-ui" }}>
       <h1 style={{ fontSize: 32, marginBottom: 8 }}>Stablecoin Compliance Monitor</h1>
       <p style={{ color: "#6b7280", marginBottom: 16 }}>
-        Monitoring recent <b>USDC</b> transfers on <b>Base</b> over the past few hours. Flags high-value (&gt;=${HIGH_VALUE_USD.toLocaleString()}) and watchlist matches.
+        Monitoring recent <b>USDC</b> transfers on <b>Base</b>. Flags high-value (≥{HIGH_VALUE_USD.toLocaleString()}) and watchlist matches.
       </p>
 
       {err && (
-        <div style={{ padding: 12, background: "#FEF2F2", color: "#991B1B", border: "1px solid #FECACA", borderRadius: 8, marginBottom: 16 }}>
+        <div style={{ padding: 12, background: "#FEF2F2", color: "#991B1B", border: "1px solid #FECACA", borderRadius: 8, marginBottom: 12 }}>
           {err}
+        </div>
+      )}
+      {!err && diag && (
+        <div style={{ padding: 10, background: "#F0FDF4", color: "#166534", border: "1px solid #BBF7D0", borderRadius: 8, marginBottom: 12 }}>
+          {diag}
         </div>
       )}
 
@@ -175,7 +194,7 @@ export default function Home() {
                   </td>
                 </tr>
               )) : (
-                <tr><td colSpan={6} style={{ padding: 12, color: "#6b7280" }}>No recent transfers pulled for this time window.</td></tr>
+                <tr><td colSpan={6} style={{ padding: 12, color: "#6b7280" }}>No transfers found for the scanned window.</td></tr>
               )}
             </tbody>
           </table>
@@ -184,7 +203,7 @@ export default function Home() {
 
       <hr style={{ margin: "24px 0", borderColor: "#e5e7eb" }} />
       <small style={{ color: "#6b7280" }}>
-        Demo only. For real compliance, add vetted sanctions lists, case management, alert review, audit trails, and on-chain analytics.
+        Demo only. For production compliance, add vetted sanctions lists, case management, human review, and audit trails.
       </small>
     </div>
   );

@@ -19,6 +19,10 @@ const WATCHLIST = [
 ];
 // Base ~2s blocks → 3600 blocks ≈ ~2 hours. Increase for a wider window.
 const BLOCK_WINDOW = 3600;
+
+// Some RPCs limit eth_getLogs range. Keep chunks small to avoid errors.
+// If you still see "Block range is too large", reduce CHUNK_SIZE further (e.g., 500).
+const CHUNK_SIZE = 800;
 // ==================================
 
 // Your Ankr RPC URL comes from Vercel env:
@@ -43,6 +47,43 @@ const TRANSFER_EVENT = parseAbiItem(
   "event Transfer(address indexed from, address indexed to, uint256 value)"
 );
 
+/**
+ * Fetch logs in small chunks to satisfy provider limits.
+ * Returns an array of viem log objects.
+ */
+async function getLogsChunked({ client, address, event, fromBlock, toBlock }) {
+  const logs = [];
+  // Guard: if from > to (weird clock skew), swap
+  let start = fromBlock < toBlock ? fromBlock : toBlock;
+  let end = toBlock > fromBlock ? toBlock : fromBlock;
+
+  const step = BigInt(CHUNK_SIZE);
+  let cursor = start;
+
+  while (cursor <= end) {
+    const chunkFrom = cursor;
+    // inclusive range; subtract 1 then add 1 is messy—keep inclusive and clamp.
+    const next = cursor + step - 1n;
+    const chunkTo = next > end ? end : next;
+
+    // Call provider for this chunk
+    // If provider still complains, reduce CHUNK_SIZE above.
+    const part = await client.getLogs({
+      address,
+      event,
+      fromBlock: chunkFrom,
+      toBlock: chunkTo,
+    });
+
+    if (part.length) logs.push(...part);
+
+    // Move to next block after this chunk
+    cursor = chunkTo + 1n;
+  }
+
+  return logs;
+}
+
 async function fetchRecentTransfers() {
   const client = getClient();
 
@@ -51,15 +92,16 @@ async function fetchRecentTransfers() {
   const fromBlock =
     latest > BigInt(BLOCK_WINDOW) ? latest - BigInt(BLOCK_WINDOW) : 0n;
 
-  // 2) Get Transfer logs for USDC in that range
-  const logs = await client.getLogs({
+  // 2) Get Transfer logs for USDC in that range (chunked to avoid provider limits)
+  const logs = await getLogsChunked({
+    client,
     address: getAddress(USDC_CONTRACT),
     event: TRANSFER_EVENT,
     fromBlock,
     toBlock: latest,
   });
 
-  if (!logs.length) return [];
+  if (!logs.length) return { rows: [], scannedBlocks: Number(latest - fromBlock) };
 
   // 3) Fetch timestamps for unique blocks (batch by block hash)
   const uniqueBlocks = [...new Set(logs.map((l) => l.blockHash))];
@@ -94,7 +136,7 @@ async function fetchRecentTransfers() {
   });
 
   rows.sort((a, b) => b.time - a.time);
-  return rows;
+  return { rows, scannedBlocks: Number(latest - fromBlock) };
 }
 
 export default function Home() {
@@ -111,15 +153,15 @@ export default function Home() {
       try {
         // Soft timeout guard (if your RPC is unreachable)
         const timeout = new Promise((_, rej) =>
-          setTimeout(() => rej(new Error("RPC timeout after 15s")), 15000)
+          setTimeout(() => rej(new Error("RPC timeout after 20s")), 20000)
         );
-        const data = await Promise.race([fetchRecentTransfers(), timeout]);
+        const { rows: data, scannedBlocks } = await Promise.race([
+          fetchRecentTransfers(),
+          timeout,
+        ]);
         setRows(data);
         setDiag(
-          `Scanned ~${BLOCK_WINDOW.toLocaleString()} recent blocks on Base (≈ ${(
-            (BLOCK_WINDOW * 2) /
-            60
-          ).toFixed(1)} minutes).`
+          `Scanned ~${scannedBlocks.toLocaleString()} blocks on Base (chunks of ${CHUNK_SIZE}).`
         );
       } catch (e) {
         console.error("RPC error:", e);
@@ -167,12 +209,6 @@ export default function Home() {
           }}
         >
           {err}
-          {ANKR_RPC ? null : (
-            <>
-              {"\n"}
-              Example value: https://rpc.ankr.com/base/YOUR_KEY
-            </>
-          )}
         </div>
       ) : null}
 
@@ -256,7 +292,9 @@ export default function Home() {
               ) : (
                 <tr>
                   <td colSpan={6} style={{ padding: 12, color: "#6b7280" }}>
-                    No transfers in the scanned window. Try widening it.
+                    No transfers in the scanned window. Try widening it (increase
+                    BLOCK_WINDOW) or reduce CHUNK_SIZE if your provider limits
+                    ranges further.
                   </td>
                 </tr>
               )}

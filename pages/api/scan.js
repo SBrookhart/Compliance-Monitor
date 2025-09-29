@@ -8,7 +8,7 @@ import {
 } from "viem";
 import { base } from "viem/chains";
 
-// ---- Server-only env (do NOT prefix with NEXT_PUBLIC_) ----
+// ---- Server-only envs (no NEXT_PUBLIC_) ----
 const PRIMARY_RPC = process.env.ANKR_BASE_RPC || "";
 const FALLBACK_RPC = process.env.FALLBACK_BASE_RPC || "";
 
@@ -20,9 +20,12 @@ const TRANSFER_EVENT = parseAbiItem(
 );
 
 // Helpers
-function okUrl(u) { return /^https?:\/\//i.test(u || ""); }
-function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
-function num(v, d) { const n = Number(v); return Number.isFinite(n) && n >= 0 ? n : d; }
+const okUrl = (u) => /^https?:\/\//i.test(u || "");
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const num = (v, d) => {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : d;
+};
 function isRateLimit(e) {
   const m = String(e?.message || e).toLowerCase();
   return m.includes("too many") || m.includes("rate limit") || m.includes("exhausted");
@@ -31,7 +34,7 @@ function makeClient(url) {
   if (!okUrl(url)) return null;
   return createPublicClient({ chain: base, transport: http(url, { batch: false }) });
 }
-async function withRetry(fn, { maxRetries, retryDelayMs, rateDelayMs, label }) {
+async function withRetry(fn, { maxRetries, retryDelayMs, rateDelayMs }) {
   let last;
   for (let i = 0; i <= maxRetries; i++) {
     try { return await fn(); }
@@ -43,16 +46,16 @@ async function withRetry(fn, { maxRetries, retryDelayMs, rateDelayMs, label }) {
   }
   throw last;
 }
-async function withClients(fn, clients, opts, label) {
+async function withClients(fn, clients, opts) {
   let last;
   for (let i = 0; i < clients.length; i++) {
-    try { return await withRetry(() => fn(clients[i]), { ...opts, label }); }
+    try { return await withRetry(() => fn(clients[i]), opts); }
     catch (e) { last = e; if (i < clients.length - 1) await sleep(800); }
   }
   throw last;
 }
 
-async function getLogsChunked({ clients, address, event, fromBlock, toBlock, chunkSize, chunkDelayMs }) {
+async function getLogsChunked({ clients, address, event, fromBlock, toBlock, chunkSize, chunkDelayMs, hardStopAtMs, startedAt }) {
   const all = [];
   let start = fromBlock < toBlock ? fromBlock : toBlock;
   let end = toBlock > fromBlock ? toBlock : fromBlock;
@@ -60,6 +63,9 @@ async function getLogsChunked({ clients, address, event, fromBlock, toBlock, chu
   let cursor = start;
 
   while (cursor <= end) {
+    // Soft time budget: return partial work if we’re running long
+    if (Date.now() - startedAt > hardStopAtMs) break;
+
     const chunkFrom = cursor;
     const next = cursor + step - 1n;
     const chunkTo = next > end ? end : next;
@@ -67,96 +73,133 @@ async function getLogsChunked({ clients, address, event, fromBlock, toBlock, chu
     const part = await withClients(
       (c) => c.getLogs({ address, event, fromBlock: chunkFrom, toBlock: chunkTo }),
       clients,
-      { maxRetries: 3, retryDelayMs: 1200, rateDelayMs: 11000 },
-      `getLogs ${chunkFrom}-${chunkTo}`
+      { maxRetries: 3, retryDelayMs: 1200, rateDelayMs: 11000 }
     );
+
     if (part.length) all.push(...part);
     cursor = chunkTo + 1n;
     if (chunkDelayMs) await sleep(chunkDelayMs);
   }
-  return all;
+
+  // Return logs and the “cursor” to continue (if any)
+  const nextFromBlock = cursor <= end ? cursor : null;
+  return { logs: all, nextFromBlock };
 }
 
 export default async function handler(req, res) {
   try {
+    // -------- Query params (all optional; numbers are strings) ----------
+    // window: number of blocks to scan in this call (not total history)
+    // target: stop early after collecting this many rows (speeds up UI)
+    // chunk: blocks per getLogs call
+    // cdelay/bdelay: delays in ms to be nicer to RPC
+    // maxms: soft time budget in ms for this server call
+    // cursorTo: if provided, scan up to this block (hex or dec). Otherwise, we start from latest.
     const {
-      window = "2400",
-      chunk = "400",
-      cdelay = "400",
-      bdelay = "200",
+      window = "1200",
+      target = "50",
+      chunk = "300",
+      cdelay = "300",
+      bdelay = "150",
       retries = "3",
-      rdelay = "1500",
+      rdelay = "1200",
       ratedelay = "11000",
+      maxms = "25000",
+      cursorTo, // optional, for paging older history
     } = req.query;
 
-    const BLOCK_WINDOW = num(window, 2400);
-    const CHUNK_SIZE = num(chunk, 400);
-    const CHUNK_DELAY_MS = num(cdelay, 400);
-    const BLOCK_TS_DELAY_MS = num(bdelay, 200);
+    const BLOCK_WINDOW = num(window, 1200);
+    const TARGET_ROWS = num(target, 50);
+    const CHUNK_SIZE = num(chunk, 300);
+    const CHUNK_DELAY_MS = num(cdelay, 300);
+    const BLOCK_TS_DELAY_MS = num(bdelay, 150);
     const MAX_RETRIES = num(retries, 3);
-    const GENERIC_RETRY_DELAY_MS = num(rdelay, 1500);
+    const GENERIC_RETRY_DELAY_MS = num(rdelay, 1200);
     const RATE_LIMIT_DELAY_MS = num(ratedelay, 11000);
+    const HARD_STOP_MS = num(maxms, 25000);
 
     const urls = [PRIMARY_RPC, FALLBACK_RPC].filter(okUrl);
     if (!urls.length) {
-      res.status(400).json({ error: "No RPC configured. Set ANKR_BASE_RPC (and optional FALLBACK_BASE_RPC) in Vercel." });
+      res.status(400).json({ error: "No RPC configured. In Vercel set ANKR_BASE_RPC (and optional FALLBACK_BASE_RPC)." });
       return;
     }
     const clients = urls.map(makeClient).filter(Boolean);
+    const startedAt = Date.now();
 
-    const latest = await withClients(
-      (c) => c.getBlockNumber(),
-      clients,
-      { maxRetries: MAX_RETRIES, retryDelayMs: GENERIC_RETRY_DELAY_MS, rateDelayMs: RATE_LIMIT_DELAY_MS },
-      "getBlockNumber"
-    );
+    // Figure out latest block and the scan range
+    const latest = cursorTo
+      ? BigInt(cursorTo) // allow passing a hex or dec string; BigInt handles both if "0x" prefix for hex
+      : await withClients(
+          (c) => c.getBlockNumber(),
+          clients,
+          { maxRetries: MAX_RETRIES, retryDelayMs: GENERIC_RETRY_DELAY_MS, rateDelayMs: RATE_LIMIT_DELAY_MS }
+        );
 
-    const fromBlock = latest > BigInt(BLOCK_WINDOW) ? latest - BigInt(BLOCK_WINDOW) : 0n;
+    // We’ll scan BACKWARD: [fromBlock .. toBlock] where toBlock = latest, fromBlock = max(0, latest - BLOCK_WINDOW + 1)
+    const toBlock = latest;
+    const fromBlock = toBlock > BigInt(BLOCK_WINDOW - 1) ? toBlock - BigInt(BLOCK_WINDOW - 1) : 0n;
 
-    const logs = await getLogsChunked({
+    // Get logs (chunked) with a soft time budget
+    const { logs, nextFromBlock } = await getLogsChunked({
       clients,
       address: getAddress(USDC_CONTRACT),
       event: TRANSFER_EVENT,
       fromBlock,
-      toBlock: latest,
+      toBlock,
       chunkSize: CHUNK_SIZE,
       chunkDelayMs: CHUNK_DELAY_MS,
+      hardStopAtMs: HARD_STOP_MS,
+      startedAt,
     });
 
+    // If still within budget and we have many blocks, cap rows to TARGET_ROWS via early exit below
     if (!logs.length) {
       res.status(200).json({
         rows: [],
-        scannedBlocks: Number(latest - fromBlock),
-        info: { urls, BLOCK_WINDOW, CHUNK_SIZE },
+        scannedBlocks: Number(toBlock - fromBlock + 1n),
+        nextCursorTo: nextFromBlock ?? (fromBlock > 0n ? fromBlock - 1n : null),
+        info: { urls, BLOCK_WINDOW, CHUNK_SIZE, partial: true },
       });
       return;
     }
 
-    const uniqueBlocks = [...new Set(logs.map((l) => l.blockHash))];
+    // Build timestamps for blocks we actually saw
+    const blockSet = new Set(logs.map((l) => l.blockHash));
     const blockMap = new Map();
-    for (const bh of uniqueBlocks) {
+    for (const bh of blockSet) {
+      if (Date.now() - startedAt > HARD_STOP_MS) break;
       const block = await withClients(
         (c) => c.getBlock({ blockHash: bh }),
         clients,
-        { maxRetries: MAX_RETRIES, retryDelayMs: GENERIC_RETRY_DELAY_MS, rateDelayMs: RATE_LIMIT_DELAY_MS },
-        "getBlock"
+        { maxRetries: MAX_RETRIES, retryDelayMs: GENERIC_RETRY_DELAY_MS, rateDelayMs: RATE_LIMIT_DELAY_MS }
       );
       blockMap.set(bh, Number(block.timestamp) * 1000);
       if (BLOCK_TS_DELAY_MS) await sleep(BLOCK_TS_DELAY_MS);
     }
 
-    const rows = logs.map((l) => {
-      const from = l.args.from;
-      const to = l.args.to;
-      const amount = Number(formatUnits(l.args.value, USDC_DECIMALS));
-      const time = blockMap.get(l.blockHash) ?? Date.now();
-      return { time, hash: l.transactionHash, from, to, amount };
-    }).sort((a, b) => b.time - a.time);
+    // Shape + trim to target count
+    const rows = logs.map((l) => ({
+      time: blockMap.get(l.blockHash) ?? Date.now(),
+      hash: l.transactionHash,
+      from: l.args.from,
+      to: l.args.to,
+      amount: Number(formatUnits(l.args.value, USDC_DECIMALS)),
+    }))
+    .sort((a, b) => b.time - a.time)
+    .slice(0, TARGET_ROWS);
 
     res.status(200).json({
       rows,
-      scannedBlocks: Number(latest - fromBlock),
-      info: { urls, BLOCK_WINDOW, CHUNK_SIZE },
+      scannedBlocks: Number(toBlock - fromBlock + 1n),
+      // For “Load more”: next call should set cursorTo = (fromBlock - 1)
+      nextCursorTo: nextFromBlock ?? (fromBlock > 0n ? fromBlock - 1n : null),
+      info: {
+        urls,
+        BLOCK_WINDOW,
+        CHUNK_SIZE,
+        TARGET_ROWS,
+        partial: Date.now() - startedAt > HARD_STOP_MS,
+      },
     });
   } catch (e) {
     res.status(500).json({ error: String(e?.message || e) });

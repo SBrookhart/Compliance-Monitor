@@ -15,6 +15,7 @@ const DEFAULTS = {
   CLIENT_TIMEOUT_MS: 120000, // 120s browser timeout
 };
 
+// ---------- helpers ----------
 const getN = (v, d) => {
   const n = Number(v);
   return Number.isFinite(n) && n >= 0 ? n : d;
@@ -23,6 +24,7 @@ const loadLocal = (k, fb) => {
   try { const v = JSON.parse(localStorage.getItem(k)); return v ?? fb; } catch { return fb; }
 };
 const saveLocal = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
+const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 
 // ---------- Settings modal ----------
 function Settings({ open, onClose, settings, setSettings, onApply }) {
@@ -145,7 +147,7 @@ function WatchlistEditor({ open, onClose, watchlist, setWatchlist, onApply }) {
     const unique = Array.from(new Set(lines));
     saveLocal("cm_watchlist", unique);
     setWatchlist(unique);
-    onApply(); // refresh scan (client flags are applied immediately)
+    onApply(); // flags update immediately
     onClose();
   }
 
@@ -187,25 +189,25 @@ function WatchlistEditor({ open, onClose, watchlist, setWatchlist, onApply }) {
 
 // ---------- CSV export ----------
 function toCsv(rows, opts = {}) {
-  const { includeFlags = true, watchlistSet = new Set() } = opts;
+  const { includeFlags = true } = opts;
   const esc = (s) => {
     const v = String(s ?? "");
     if (/[",\n]/.test(v)) return `"${v.replace(/"/g, '""')}"`;
     return v;
   };
-  const header = ["TimeUTC", "TxHash", "From", "To", "AmountUSDC", ...(includeFlags ? ["Flags"] : [])];
+  const header = ["TimeUTC", "TxHash", "From", "To", "AmountUSDC", "RiskScore", ...(includeFlags ? ["Flags"] : [])];
   const lines = [header.join(",")];
   for (const r of rows) {
     const flags = [];
-    if (r.amount >= HIGH_VALUE_USD) flags.push("HighValue");
-    const isWL = watchlistSet.has((r.from || "").toLowerCase()) || watchlistSet.has((r.to || "").toLowerCase());
-    if (isWL) flags.push("Watchlist");
+    if (r.flaggedLarge) flags.push("HighValue");
+    if (r.flaggedWatchlist) flags.push("Watchlist");
     const line = [
       esc(new Date(r.time).toISOString().replace("T", " ").slice(0, 19)),
       esc(r.hash),
       esc(r.from),
       esc(r.to),
       esc(r.amount),
+      esc(r.riskScore),
       ...(includeFlags ? [esc(flags.join("|"))] : []),
     ].join(",");
     lines.push(line);
@@ -223,6 +225,52 @@ function downloadCsv(filename, csvText) {
   a.click();
   document.body.removeChild(a);
   URL.revokeObjectURL(url);
+}
+
+// ---------- Risk Scoring ----------
+/**
+ * Rule-based Risk Score (0–100)
+ * +40 if amount >= HIGH_VALUE_USD
+ * +25 if watchlist hit (from or to)
+ * +15 if "velocity" burst: same address appears in >=3 transfers within last 10 minutes of this slice
+ * Score is clamped to 100
+ */
+function computeRisk(tx, { watchlistSet, recentCounts }) {
+  let score = 0;
+  if (tx.amount >= HIGH_VALUE_USD) score += 40;
+
+  const fromWL = watchlistSet.has((tx.from || "").toLowerCase());
+  const toWL = watchlistSet.has((tx.to || "").toLowerCase());
+  if (fromWL || toWL) score += 25;
+
+  const tenMinAgo = Date.now() - 10 * 60 * 1000;
+  const burst = (recentCounts.get((tx.from || "").toLowerCase()) ?? 0)
+             + (recentCounts.get((tx.to || "").toLowerCase()) ?? 0);
+  // Only count "recent" rows; recentCounts already built with time filter
+  if (burst >= 3) score += 15;
+
+  return clamp(score, 0, 100);
+}
+
+/** Build a quick map of recent appearances per address (last 10 minutes) */
+function buildRecentCounts(rows) {
+  const cutoff = Date.now() - 10 * 60 * 1000; // 10 minutes
+  const m = new Map();
+  for (const r of rows) {
+    if ((r.time ?? 0) < cutoff) continue;
+    const f = (r.from || "").toLowerCase();
+    const t = (r.to || "").toLowerCase();
+    if (f) m.set(f, (m.get(f) ?? 0) + 1);
+    if (t) m.set(t, (m.get(t) ?? 0) + 1);
+  }
+  return m;
+}
+
+/** Map a risk score into a color + label */
+function riskBucket(score) {
+  if (score >= 51) return { label: "High", bg: "#fee2e2", text: "#991b1b", border: "#fecaca" };     // red-ish
+  if (score >= 21) return { label: "Medium", bg: "#fef3c7", text: "#92400e", border: "#fde68a" };  // amber-ish
+  return { label: "Low", bg: "#ecfdf5", text: "#065f46", border: "#a7f3d0" };                      // green-ish
 }
 
 // ---------- Main page ----------
@@ -285,35 +333,49 @@ export default function Home() {
 
   const hasData = useMemo(() => rows.length > 0, [rows]);
 
-  // Derive flagged rows (client-side flags)
-  const flaggedRows = useMemo(() => {
+  // Build recent address counts (10-minute window) for velocity heuristic
+  const recentCounts = useMemo(() => buildRecentCounts(rows), [rows]);
+
+  // Derive flags + risk scores
+  const enrichedRows = useMemo(() => {
     return rows.map((r) => {
-      const isWL =
+      const flaggedLarge = r.amount >= HIGH_VALUE_USD;
+      const flaggedWatchlist =
         watchlistSet.has((r.from || "").toLowerCase()) ||
         watchlistSet.has((r.to || "").toLowerCase());
-      return {
-        ...r,
-        flaggedLarge: r.amount >= HIGH_VALUE_USD,
-        flaggedWatchlist: isWL,
-      };
+      const riskScore = computeRisk(r, { watchlistSet, recentCounts });
+      return { ...r, flaggedLarge, flaggedWatchlist, riskScore };
     });
-  }, [rows, watchlistSet]);
+  }, [rows, watchlistSet, recentCounts]);
 
-  // Export current visible rows to CSV
+  // Export current visible rows (enriched) to CSV
   function handleExportCsv() {
-    const csv = toCsv(flaggedRows, { includeFlags: true, watchlistSet });
+    const csv = toCsv(enrichedRows, { includeFlags: true });
     const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
     downloadCsv(`compliance-monitor_${ts}.csv`, csv);
   }
 
-  // Modal toggles
+  // Modals
   const [openWatchlist, setOpenWatchlist] = useState(false);
+
+  // Legend styles
+  const legendBadge = (bg, text, border) => ({
+    display: "inline-block",
+    padding: "4px 8px",
+    borderRadius: 9999,
+    background: bg,
+    color: text,
+    border: `1px solid ${border}`,
+    fontSize: 12,
+    fontWeight: 700,
+    marginRight: 8,
+  });
 
   return (
     <div style={{ maxWidth: 980, margin: "40px auto", padding: 16, fontFamily: "ui-sans-serif, system-ui" }}>
       <h1 style={{ fontSize: 32, marginBottom: 8 }}>Stablecoin Compliance Monitor</h1>
       <p style={{ color: "#6b7280", marginBottom: 16 }}>
-        Live on-chain scan of recent <b>USDC</b> transfers on <b>Base</b>. Flags high-value (≥{HIGH_VALUE_USD.toLocaleString()}) and watchlist matches.
+        Live on-chain scan of recent <b>USDC</b> transfers on <b>Base</b>. Flags high-value (≥{HIGH_VALUE_USD.toLocaleString()}), watchlist matches, and now assigns a rule-based <b>Risk Score</b>.
       </p>
 
       {/* Controls */}
@@ -333,6 +395,19 @@ export default function Home() {
         <button onClick={handleExportCsv} disabled={!hasData} style={{ padding: "10px 14px", borderRadius: 10, border: 0, background: hasData ? "#0f766e" : "#94a3b8", color: "#fff", cursor: hasData ? "pointer" : "not-allowed", fontWeight: 600 }}>
           ⬇️ Export CSV
         </button>
+      </div>
+
+      {/* Legend */}
+      <div style={{ padding: 12, border: "1px solid #e5e7eb", borderRadius: 10, marginBottom: 12, background: "#fafafa" }}>
+        <div style={{ fontWeight: 700, marginBottom: 6 }}>Risk Score (0–100)</div>
+        <div style={{ marginBottom: 8, fontSize: 14, color: "#374151" }}>
+          +40 High value (≥{HIGH_VALUE_USD.toLocaleString()} USDC) · +25 Watchlist hit · +15 Velocity burst (≥3 appearances by either party in last 10 minutes)
+        </div>
+        <div>
+          <span style={legendBadge("#fee2e2", "#991b1b", "#fecaca")}>High (≥51)</span>
+          <span style={legendBadge("#fef3c7", "#92400e", "#fde68a")}>Medium (21–50)</span>
+          <span style={legendBadge("#ecfdf5", "#065f46", "#a7f3d0")}>Low (0–20)</span>
+        </div>
       </div>
 
       {watchlist.length > 0 ? (
@@ -357,6 +432,7 @@ export default function Home() {
         </div>
       ) : null}
 
+      {/* Table */}
       {loading ? (
         <div>Loading…</div>
       ) : (
@@ -370,39 +446,55 @@ export default function Home() {
                 <th style={{ padding: 8 }}>To</th>
                 <th style={{ padding: 8 }}>Amount (USDC)</th>
                 <th style={{ padding: 8 }}>Flags</th>
+                <th style={{ padding: 8 }}>Risk</th>
               </tr>
             </thead>
             <tbody>
               {hasData ? (
-                flaggedRows.map((tx, i) => (
-                  <tr key={`${tx.hash}-${i}`} style={{ borderBottom: "1px solid #f1f5f9" }}>
-                    <td style={{ padding: 8 }}>
-                      {new Date(tx.time).toISOString().replace("T", " ").slice(0, 19)}
-                    </td>
-                    <td style={{ padding: 8 }}>
-                      <a href={`https://basescan.org/tx/${tx.hash}`} target="_blank" rel="noreferrer" style={{ color: "#2563eb", fontWeight: 600 }}>
-                        {tx.hash.slice(0, 10)}…
-                      </a>
-                    </td>
-                    <td style={{ padding: 8 }}>{tx.from.slice(0, 10)}…</td>
-                    <td style={{ padding: 8 }}>{tx.to.slice(0, 10)}…</td>
-                    <td style={{ padding: 8 }}>{tx.amount.toLocaleString()}</td>
-                    <td style={{ padding: 8 }}>
-                      {tx.flaggedLarge ? (
-                        <span style={{ color: "#b91c1c", fontWeight: 700 }}>High&nbsp;Value&nbsp;</span>
-                      ) : null}
-                      {tx.flaggedWatchlist ? (
-                        <span style={{ color: "#b45309", fontWeight: 700 }}>Watchlist</span>
-                      ) : null}
-                      {!tx.flaggedLarge && !tx.flaggedWatchlist ? (
-                        <span style={{ color: "#6b7280" }}>—</span>
-                      ) : null}
-                    </td>
-                  </tr>
-                ))
+                enrichedRows.map((tx, i) => {
+                  const bucket = riskBucket(tx.riskScore);
+                  return (
+                    <tr key={`${tx.hash}-${i}`} style={{ borderBottom: "1px solid #f1f5f9" }}>
+                      <td style={{ padding: 8 }}>
+                        {new Date(tx.time).toISOString().replace("T", " ").slice(0, 19)}
+                      </td>
+                      <td style={{ padding: 8 }}>
+                        <a href={`https://basescan.org/tx/${tx.hash}`} target="_blank" rel="noreferrer" style={{ color: "#2563eb", fontWeight: 600 }}>
+                          {tx.hash.slice(0, 10)}…
+                        </a>
+                      </td>
+                      <td style={{ padding: 8 }}>{tx.from.slice(0, 10)}…</td>
+                      <td style={{ padding: 8 }}>{tx.to.slice(0, 10)}…</td>
+                      <td style={{ padding: 8 }}>{tx.amount.toLocaleString()}</td>
+                      <td style={{ padding: 8 }}>
+                        {tx.flaggedLarge ? (
+                          <span style={{ color: "#b91c1c", fontWeight: 700, marginRight: 8 }}>High&nbsp;Value</span>
+                        ) : null}
+                        {tx.flaggedWatchlist ? (
+                          <span style={{ color: "#b45309", fontWeight: 700 }}>Watchlist</span>
+                        ) : null}
+                        {!tx.flaggedLarge && !tx.flaggedWatchlist ? (
+                          <span style={{ color: "#6b7280" }}>—</span>
+                        ) : null}
+                      </td>
+                      <td style={{ padding: 8 }}>
+                        <span style={{
+                          padding: "4px 8px",
+                          borderRadius: 9999,
+                          background: bucket.bg,
+                          color: bucket.text,
+                          border: `1px solid ${bucket.border}`,
+                          fontWeight: 700,
+                        }}>
+                          {tx.riskScore} ({bucket.label})
+                        </span>
+                      </td>
+                    </tr>
+                  );
+                })
               ) : (
                 <tr>
-                  <td colSpan={6} style={{ padding: 12, color: "#6b7280" }}>
+                  <td colSpan={7} style={{ padding: 12, color: "#6b7280" }}>
                     No transfers returned in this slice. Use ⚙️ Settings to widen the window or “Load more (older)”.
                   </td>
                 </tr>
@@ -414,7 +506,7 @@ export default function Home() {
 
       <hr style={{ margin: "24px 0", borderColor: "#e5e7eb" }} />
       <small style={{ color: "#6b7280" }}>
-        Demo only. For production compliance, add vetted lists, case management, and audit trails.
+        Demo only. Risk scores are heuristic and illustrative, not a substitute for formal AML programs.
       </small>
 
       {/* Modals */}
@@ -430,7 +522,7 @@ export default function Home() {
         onClose={() => setOpenWatchlist(false)}
         watchlist={watchlist}
         setWatchlist={setWatchlist}
-        onApply={() => { /* no re-scan necessary; flags update immediately */ }}
+        onApply={() => { /* flags update immediately */ }}
       />
     </div>
   );

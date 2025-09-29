@@ -88,13 +88,7 @@ async function getLogsChunked({ clients, address, event, fromBlock, toBlock, chu
 
 export default async function handler(req, res) {
   try {
-    // -------- Query params (all optional; numbers are strings) ----------
-    // window: number of blocks to scan in this call (not total history)
-    // target: stop early after collecting this many rows (speeds up UI)
-    // chunk: blocks per getLogs call
-    // cdelay/bdelay: delays in ms to be nicer to RPC
-    // maxms: soft time budget in ms for this server call
-    // cursorTo: if provided, scan up to this block (hex or dec). Otherwise, we start from latest.
+    // ---------- Query params ----------
     const {
       window = "1200",
       target = "50",
@@ -105,7 +99,7 @@ export default async function handler(req, res) {
       rdelay = "1200",
       ratedelay = "11000",
       maxms = "25000",
-      cursorTo, // optional, for paging older history
+      cursorTo, // optional for paging older history
     } = req.query;
 
     const BLOCK_WINDOW = num(window, 1200);
@@ -126,20 +120,21 @@ export default async function handler(req, res) {
     const clients = urls.map(makeClient).filter(Boolean);
     const startedAt = Date.now();
 
-    // Figure out latest block and the scan range
-    const latest = cursorTo
-      ? BigInt(cursorTo) // allow passing a hex or dec string; BigInt handles both if "0x" prefix for hex
+    // Latest block or continue from a provided cursor
+    const toBlock = cursorTo
+      ? BigInt(cursorTo) // "0x..." or decimal string both work with BigInt()
       : await withClients(
           (c) => c.getBlockNumber(),
           clients,
           { maxRetries: MAX_RETRIES, retryDelayMs: GENERIC_RETRY_DELAY_MS, rateDelayMs: RATE_LIMIT_DELAY_MS }
         );
 
-    // We’ll scan BACKWARD: [fromBlock .. toBlock] where toBlock = latest, fromBlock = max(0, latest - BLOCK_WINDOW + 1)
-    const toBlock = latest;
-    const fromBlock = toBlock > BigInt(BLOCK_WINDOW - 1) ? toBlock - BigInt(BLOCK_WINDOW - 1) : 0n;
+    // Scan BACKWARD window
+    const fromBlock = toBlock > BigInt(BLOCK_WINDOW - 1)
+      ? toBlock - BigInt(BLOCK_WINDOW - 1)
+      : 0n;
 
-    // Get logs (chunked) with a soft time budget
+    // Logs (chunked, with soft time budget)
     const { logs, nextFromBlock } = await getLogsChunked({
       clients,
       address: getAddress(USDC_CONTRACT),
@@ -152,18 +147,18 @@ export default async function handler(req, res) {
       startedAt,
     });
 
-    // If still within budget and we have many blocks, cap rows to TARGET_ROWS via early exit below
+    // If no logs (or time-boxed before getting any), still return cursors (as strings)
     if (!logs.length) {
       res.status(200).json({
         rows: [],
         scannedBlocks: Number(toBlock - fromBlock + 1n),
-        nextCursorTo: nextFromBlock ?? (fromBlock > 0n ? fromBlock - 1n : null),
+        nextCursorTo: nextFromBlock ? nextFromBlock.toString() : (fromBlock > 0n ? (fromBlock - 1n).toString() : null),
         info: { urls, BLOCK_WINDOW, CHUNK_SIZE, partial: true },
       });
       return;
     }
 
-    // Build timestamps for blocks we actually saw
+    // Timestamps for blocks we saw
     const blockSet = new Set(logs.map((l) => l.blockHash));
     const blockMap = new Map();
     for (const bh of blockSet) {
@@ -177,22 +172,25 @@ export default async function handler(req, res) {
       if (BLOCK_TS_DELAY_MS) await sleep(BLOCK_TS_DELAY_MS);
     }
 
-    // Shape + trim to target count
-    const rows = logs.map((l) => ({
-      time: blockMap.get(l.blockHash) ?? Date.now(),
-      hash: l.transactionHash,
-      from: l.args.from,
-      to: l.args.to,
-      amount: Number(formatUnits(l.args.value, USDC_DECIMALS)),
-    }))
-    .sort((a, b) => b.time - a.time)
-    .slice(0, TARGET_ROWS);
+    // Rows (plain JSON-safe types only)
+    const rows = logs
+      .map((l) => ({
+        time: blockMap.get(l.blockHash) ?? Date.now(),    // number
+        hash: l.transactionHash,                           // string
+        from: l.args.from,                                 // string
+        to: l.args.to,                                     // string
+        amount: Number(formatUnits(l.args.value, USDC_DECIMALS)), // number
+      }))
+      .sort((a, b) => b.time - a.time)
+      .slice(0, TARGET_ROWS);
 
     res.status(200).json({
       rows,
       scannedBlocks: Number(toBlock - fromBlock + 1n),
-      // For “Load more”: next call should set cursorTo = (fromBlock - 1)
-      nextCursorTo: nextFromBlock ?? (fromBlock > 0n ? fromBlock - 1n : null),
+      // IMPORTANT: Serialize BigInt cursor to string
+      nextCursorTo: nextFromBlock
+        ? nextFromBlock.toString()
+        : (fromBlock > 0n ? (fromBlock - 1n).toString() : null),
       info: {
         urls,
         BLOCK_WINDOW,

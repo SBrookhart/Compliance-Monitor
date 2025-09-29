@@ -1,22 +1,28 @@
 import { useEffect, useMemo, useState } from "react";
 
-// Flags (client display only)
 const HIGH_VALUE_USD = 10000;
 
-// Defaults for UI Settings (sent to API as query params)
+// UI defaults — you can tweak these live in Settings (saved to your browser)
 const DEFAULTS = {
-  BLOCK_WINDOW: 2400,     // ~80 min
-  CHUNK_SIZE: 400,
-  CHUNK_DELAY_MS: 400,
-  BLOCK_TS_DELAY_MS: 200,
+  BLOCK_WINDOW: 1200,     // blocks per call (~40–45 min on Base)
+  TARGET_ROWS: 50,        // stop early when we have this many rows
+  CHUNK_SIZE: 300,        // blocks per getLogs
+  CHUNK_DELAY_MS: 300,    // pause between log chunks
+  BLOCK_TS_DELAY_MS: 150, // pause between block timestamp lookups
   MAX_RETRIES: 3,
-  GENERIC_RETRY_DELAY_MS: 1500,
+  GENERIC_RETRY_DELAY_MS: 1200,
   RATE_LIMIT_DELAY_MS: 11000,
+  CLIENT_TIMEOUT_MS: 120000, // 120s browser timeout
 };
 
-function loadLocal(k, fallback) { try { const v = JSON.parse(localStorage.getItem(k)); return v ?? fallback; } catch { return fallback; } }
-function saveLocal(k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch { } }
-function toNumber(v, d) { const n = Number(v); return Number.isFinite(n) && n >= 0 ? n : d; }
+const getN = (v, d) => {
+  const n = Number(v);
+  return Number.isFinite(n) && n >= 0 ? n : d;
+};
+const loadLocal = (k, fb) => {
+  try { const v = JSON.parse(localStorage.getItem(k)); return v ?? fb; } catch { return fb; }
+};
+const saveLocal = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
 
 function Settings({ open, onClose, settings, setSettings, onApply }) {
   const [local, setLocal] = useState(settings);
@@ -26,39 +32,47 @@ function Settings({ open, onClose, settings, setSettings, onApply }) {
   const label = { fontWeight: 600, marginTop: 10, marginBottom: 6, display: "block" };
   const input = { width: "100%", padding: 8, borderRadius: 8, border: "1px solid #e5e7eb", fontFamily: "inherit" };
 
-  function update(k, v) { setLocal((s) => ({ ...s, [k]: v })); }
-  function handleSave() {
+  const update = (k, v) => setLocal((s) => ({ ...s, [k]: v }));
+
+  const handleSave = () => {
     const cleaned = {
-      BLOCK_WINDOW: toNumber(local.BLOCK_WINDOW, DEFAULTS.BLOCK_WINDOW),
-      CHUNK_SIZE: toNumber(local.CHUNK_SIZE, DEFAULTS.CHUNK_SIZE),
-      CHUNK_DELAY_MS: toNumber(local.CHUNK_DELAY_MS, DEFAULTS.CHUNK_DELAY_MS),
-      BLOCK_TS_DELAY_MS: toNumber(local.BLOCK_TS_DELAY_MS, DEFAULTS.BLOCK_TS_DELAY_MS),
-      MAX_RETRIES: toNumber(local.MAX_RETRIES, DEFAULTS.MAX_RETRIES),
-      GENERIC_RETRY_DELAY_MS: toNumber(local.GENERIC_RETRY_DELAY_MS, DEFAULTS.GENERIC_RETRY_DELAY_MS),
-      RATE_LIMIT_DELAY_MS: toNumber(local.RATE_LIMIT_DELAY_MS, DEFAULTS.RATE_LIMIT_DELAY_MS),
+      BLOCK_WINDOW: getN(local.BLOCK_WINDOW, DEFAULTS.BLOCK_WINDOW),
+      TARGET_ROWS: getN(local.TARGET_ROWS, DEFAULTS.TARGET_ROWS),
+      CHUNK_SIZE: getN(local.CHUNK_SIZE, DEFAULTS.CHUNK_SIZE),
+      CHUNK_DELAY_MS: getN(local.CHUNK_DELAY_MS, DEFAULTS.CHUNK_DELAY_MS),
+      BLOCK_TS_DELAY_MS: getN(local.BLOCK_TS_DELAY_MS, DEFAULTS.BLOCK_TS_DELAY_MS),
+      MAX_RETRIES: getN(local.MAX_RETRIES, DEFAULTS.MAX_RETRIES),
+      GENERIC_RETRY_DELAY_MS: getN(local.GENERIC_RETRY_DELAY_MS, DEFAULTS.GENERIC_RETRY_DELAY_MS),
+      RATE_LIMIT_DELAY_MS: getN(local.RATE_LIMIT_DELAY_MS, DEFAULTS.RATE_LIMIT_DELAY_MS),
+      CLIENT_TIMEOUT_MS: getN(local.CLIENT_TIMEOUT_MS, DEFAULTS.CLIENT_TIMEOUT_MS),
     };
     saveLocal("cm_settings", cleaned);
     setSettings(cleaned);
-    onApply();
+    onApply({ reset: true });
     onClose();
-  }
-  function handleReset() {
+  };
+
+  const handleReset = () => {
     saveLocal("cm_settings", DEFAULTS);
     setSettings({ ...DEFAULTS });
-    onApply();
+    onApply({ reset: true });
     onClose();
-  }
+  };
 
   return (
     <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.25)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 9999 }}>
-      <div style={{ background: "#fff", borderRadius: 12, maxWidth: 700, width: "90%", padding: 16, boxShadow: "0 10px 30px rgba(0,0,0,0.2)" }}>
+      <div style={{ background: "#fff", borderRadius: 12, maxWidth: 720, width: "90%", padding: 16, boxShadow: "0 10px 30px rgba(0,0,0,0.2)" }}>
         <h2 style={{ marginTop: 0 }}>Settings</h2>
-        <p style={{ color: "#6b7280", marginTop: 0 }}>Tune these if you see timeouts or rate limits. Saved only in your browser.</p>
+        <p style={{ color: "#6B7280", marginTop: 0 }}>Tune these if you see timeouts or rate limits. Saved to your browser only.</p>
 
         <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
           <div>
-            <label style={label}>Block Window (blocks)</label>
+            <label style={label}>Blocks per Call (window)</label>
             <input style={input} type="number" value={local.BLOCK_WINDOW} onChange={(e) => update("BLOCK_WINDOW", e.target.value)} />
+          </div>
+          <div>
+            <label style={label}>Target Rows per Call</label>
+            <input style={input} type="number" value={local.TARGET_ROWS} onChange={(e) => update("TARGET_ROWS", e.target.value)} />
           </div>
           <div>
             <label style={label}>Chunk Size (blocks per getLogs)</label>
@@ -69,7 +83,7 @@ function Settings({ open, onClose, settings, setSettings, onApply }) {
             <input style={input} type="number" value={local.CHUNK_DELAY_MS} onChange={(e) => update("CHUNK_DELAY_MS", e.target.value)} />
           </div>
           <div>
-            <label style={label}>Delay Between Block Timestamp Calls (ms)</label>
+            <label style={label}>Delay Between Block Timestamps (ms)</label>
             <input style={input} type="number" value={local.BLOCK_TS_DELAY_MS} onChange={(e) => update("BLOCK_TS_DELAY_MS", e.target.value)} />
           </div>
           <div>
@@ -81,15 +95,25 @@ function Settings({ open, onClose, settings, setSettings, onApply }) {
             <input style={input} type="number" value={local.GENERIC_RETRY_DELAY_MS} onChange={(e) => update("GENERIC_RETRY_DELAY_MS", e.target.value)} />
           </div>
           <div>
-            <label style={label}>Rate Limit Retry Delay (ms)</label>
+            <label style={label}>Rate-Limit Retry Delay (ms)</label>
             <input style={input} type="number" value={local.RATE_LIMIT_DELAY_MS} onChange={(e) => update("RATE_LIMIT_DELAY_MS", e.target.value)} />
+          </div>
+          <div>
+            <label style={label}>Browser Request Timeout (ms)</label>
+            <input style={input} type="number" value={local.CLIENT_TIMEOUT_MS} onChange={(e) => update("CLIENT_TIMEOUT_MS", e.target.value)} />
           </div>
         </div>
 
         <div style={{ display: "flex", gap: 8, marginTop: 16, justifyContent: "flex-end" }}>
-          <button onClick={handleReset} style={{ padding: "10px 14px", borderRadius: 10, border: "1px solid #e5e7eb", background: "#fff", cursor: "pointer" }}>Reset Defaults</button>
-          <button onClick={onClose} style={{ padding: "10px 14px", borderRadius: 10, border: "1px solid #e5e7eb", background: "#fff", cursor: "pointer" }}>Cancel</button>
-          <button onClick={handleSave} style={{ padding: "10px 14px", borderRadius: 10, border: 0, background: "#111827", color: "#fff", cursor: "pointer", fontWeight: 600 }}>Save & Refresh</button>
+          <button onClick={handleReset} style={{ padding: "10px 14px", borderRadius: 10, border: "1px solid #e5e7eb", background: "#fff", cursor: "pointer" }}>
+            Reset Defaults
+          </button>
+          <button onClick={onClose} style={{ padding: "10px 14px", borderRadius: 10, border: "1px solid #e5e7eb", background: "#fff", cursor: "pointer" }}>
+            Cancel
+          </button>
+          <button onClick={handleSave} style={{ padding: "10px 14px", borderRadius: 10, border: 0, background: "#111827", color: "#fff", cursor: "pointer", fontWeight: 600 }}>
+            Save & Refresh
+          </button>
         </div>
       </div>
     </div>
@@ -99,37 +123,49 @@ function Settings({ open, onClose, settings, setSettings, onApply }) {
 export default function Home() {
   const [settings, setSettings] = useState(() => loadLocal("cm_settings", { ...DEFAULTS }));
   const [rows, setRows] = useState([]);
+  const [nextCursorTo, setNextCursorTo] = useState(null);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState("");
   const [diag, setDiag] = useState("");
   const [openSettings, setOpenSettings] = useState(false);
 
-  async function runScan() {
+  async function scan({ reset = false } = {}) {
     setLoading(true);
     setErr("");
     setDiag("");
     try {
-      const params = new URLSearchParams({
-        window: String(settings.BLOCK_WINDOW),
-        chunk: String(settings.CHUNK_SIZE),
-        cdelay: String(settings.CHUNK_DELAY_MS),
-        bdelay: String(settings.BLOCK_TS_DELAY_MS),
-        retries: String(settings.MAX_RETRIES),
-        rdelay: String(settings.GENERIC_RETRY_DELAY_MS),
-        ratedelay: String(settings.RATE_LIMIT_DELAY_MS),
-      });
+      const cursorParam = !reset && nextCursorTo != null ? `&cursorTo=${String(nextCursorTo)}` : "";
+      const qs =
+        `window=${encodeURIComponent(String(settings.BLOCK_WINDOW))}` +
+        `&target=${encodeURIComponent(String(settings.TARGET_ROWS))}` +
+        `&chunk=${encodeURIComponent(String(settings.CHUNK_SIZE))}` +
+        `&cdelay=${encodeURIComponent(String(settings.CHUNK_DELAY_MS))}` +
+        `&bdelay=${encodeURIComponent(String(settings.BLOCK_TS_DELAY_MS))}` +
+        `&retries=${encodeURIComponent(String(settings.MAX_RETRIES))}` +
+        `&rdelay=${encodeURIComponent(String(settings.GENERIC_RETRY_DELAY_MS))}` +
+        `&ratedelay=${encodeURIComponent(String(settings.RATE_LIMIT_DELAY_MS))}` +
+        `&maxms=${encodeURIComponent(String(Math.max(15000, settings.CLIENT_TIMEOUT_MS - 3000)))}` + // give server a little less than client cap
+        cursorParam;
+
       const controller = new AbortController();
-      const to = setTimeout(() => controller.abort(), 60000); // 60s client cap
-      const resp = await fetch(`/api/scan?${params.toString()}`, { signal: controller.signal });
+      const to = setTimeout(() => controller.abort(), Math.max(15000, settings.CLIENT_TIMEOUT_MS));
+      const resp = await fetch(`/api/scan?${qs}`, { signal: controller.signal });
       clearTimeout(to);
 
       if (!resp.ok) {
-        const problem = await resp.json().catch(() => ({}));
-        throw new Error(problem?.error || `Scan failed with ${resp.status}`);
+        const j = await resp.json().catch(() => ({}));
+        throw new Error(j?.error || `Scan failed with ${resp.status}`);
       }
       const data = await resp.json();
-      setRows(data.rows || []);
-      setDiag(`Scanned ~${(data.scannedBlocks || 0).toLocaleString()} blocks (chunk ${settings.CHUNK_SIZE}).`);
+
+      setNextCursorTo(data.nextCursorTo ?? null);
+      setDiag(
+        `Fetched ${data.rows?.length ?? 0} rows; scanned ~${(data.scannedBlocks || 0).toLocaleString()} blocks. ` +
+        (data.info?.partial ? "Partial (time-boxed)." : "Complete window.")
+      );
+
+      // If reset, replace; else append
+      setRows((prev) => (reset ? (data.rows || []) : [...prev, ...(data.rows || [])]));
     } catch (e) {
       setErr(String(e?.message || e));
     } finally {
@@ -137,7 +173,7 @@ export default function Home() {
     }
   }
 
-  useEffect(() => { runScan(); /* on mount */ }, []); // eslint-disable-line
+  useEffect(() => { scan({ reset: true }); /* on first load */ }, []); // eslint-disable-line
 
   const hasData = useMemo(() => rows.length > 0, [rows]);
 
@@ -148,12 +184,15 @@ export default function Home() {
         Live on-chain scan of recent <b>USDC</b> transfers on <b>Base</b>. Flags high-value (≥{HIGH_VALUE_USD.toLocaleString()}) and watchlist matches.
       </p>
 
-      <div style={{ display: "flex", gap: 8, marginBottom: 12 }}>
+      <div style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
         <button onClick={() => setOpenSettings(true)} style={{ padding: "10px 14px", borderRadius: 10, border: "1px solid #e5e7eb", background: "#fff", cursor: "pointer" }}>
           ⚙️ Settings
         </button>
-        <button onClick={runScan} disabled={loading} style={{ padding: "10px 14px", borderRadius: 10, border: 0, background: "#111827", color: "#fff", cursor: "pointer", fontWeight: 600 }}>
-          {loading ? "Scanning…" : "Refresh"}
+        <button onClick={() => scan({ reset: true })} disabled={loading} style={{ padding: "10px 14px", borderRadius: 10, border: 0, background: "#111827", color: "#fff", cursor: "pointer", fontWeight: 600 }}>
+          {loading ? "Scanning…" : "Refresh (newest)"}
+        </button>
+        <button onClick={() => scan({ reset: false })} disabled={loading || nextCursorTo == null} style={{ padding: "10px 14px", borderRadius: 10, border: "1px solid #e5e7eb", background: "#fff", cursor: nextCursorTo == null ? "not-allowed" : "pointer" }}>
+          Load more (older)
         </button>
       </div>
 
@@ -187,7 +226,7 @@ export default function Home() {
             <tbody>
               {hasData ? (
                 rows.map((tx, i) => (
-                  <tr key={i} style={{ borderBottom: "1px solid #f1f5f9" }}>
+                  <tr key={`${tx.hash}-${i}`} style={{ borderBottom: "1px solid #f1f5f9" }}>
                     <td style={{ padding: 8 }}>
                       {new Date(tx.time).toISOString().replace("T", " ").slice(0, 19)}
                     </td>
@@ -203,14 +242,13 @@ export default function Home() {
                       {tx.amount >= HIGH_VALUE_USD ? (
                         <span style={{ color: "#b91c1c", fontWeight: 700 }}>High&nbsp;Value&nbsp;</span>
                       ) : null}
-                      {/* Watchlist UI not wired yet on client (server returns from/to) */}
                     </td>
                   </tr>
                 ))
               ) : (
                 <tr>
                   <td colSpan={6} style={{ padding: 12, color: "#6b7280" }}>
-                    No transfers in the scanned window. Use ⚙️ Settings to widen the window or adjust chunking.
+                    No transfers returned in this slice. Use ⚙️ Settings to widen the window or “Load more (older)”.
                   </td>
                 </tr>
               )}
@@ -229,7 +267,7 @@ export default function Home() {
         onClose={() => setOpenSettings(false)}
         settings={settings}
         setSettings={setSettings}
-        onApply={runScan}
+        onApply={scan}
       />
     </div>
   );

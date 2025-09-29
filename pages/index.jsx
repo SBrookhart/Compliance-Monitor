@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 
 const HIGH_VALUE_USD = 10000;
 
-// UI defaults — you can tweak these live in Settings (saved to your browser)
+// UI defaults — tweak live in Settings (saved to your browser)
 const DEFAULTS = {
   BLOCK_WINDOW: 1200,     // blocks per call (~40–45 min on Base)
   TARGET_ROWS: 50,        // stop early when we have this many rows
@@ -24,6 +24,7 @@ const loadLocal = (k, fb) => {
 };
 const saveLocal = (k, v) => { try { localStorage.setItem(k, JSON.stringify(v)); } catch {} };
 
+// ---------- Settings modal ----------
 function Settings({ open, onClose, settings, setSettings, onApply }) {
   const [local, setLocal] = useState(settings);
   useEffect(() => { setLocal(settings); }, [settings]);
@@ -31,7 +32,6 @@ function Settings({ open, onClose, settings, setSettings, onApply }) {
 
   const label = { fontWeight: 600, marginTop: 10, marginBottom: 6, display: "block" };
   const input = { width: "100%", padding: 8, borderRadius: 8, border: "1px solid #e5e7eb", fontFamily: "inherit" };
-
   const update = (k, v) => setLocal((s) => ({ ...s, [k]: v }));
 
   const handleSave = () => {
@@ -120,6 +120,112 @@ function Settings({ open, onClose, settings, setSettings, onApply }) {
   );
 }
 
+// ---------- Watchlist modal ----------
+function normalizeAddr(s) {
+  if (!s) return "";
+  const v = String(s).trim();
+  if (v.startsWith("0x") && v.length === 42) return v.toLowerCase();
+  return "";
+}
+function isAddr(s) { return /^0x[a-fA-F0-9]{40}$/.test(s || ""); }
+
+function WatchlistEditor({ open, onClose, watchlist, setWatchlist, onApply }) {
+  const [local, setLocal] = useState(watchlist.join("\n"));
+  useEffect(() => { setLocal(watchlist.join("\n")); }, [watchlist]);
+  if (!open) return null;
+
+  const sample = "0x1111111111111111111111111111111111111111\n0x2222222222222222222222222222222222222222";
+  const textarea = {
+    width: "100%", minHeight: 180, padding: 8, borderRadius: 8,
+    border: "1px solid #e5e7eb", fontFamily: "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace"
+  };
+
+  function handleSave() {
+    const lines = local.split(/\r?\n/).map(normalizeAddr).filter(Boolean);
+    const unique = Array.from(new Set(lines));
+    saveLocal("cm_watchlist", unique);
+    setWatchlist(unique);
+    onApply(); // refresh scan (client flags are applied immediately)
+    onClose();
+  }
+
+  function handleClear() {
+    saveLocal("cm_watchlist", []);
+    setWatchlist([]);
+    onApply();
+    onClose();
+  }
+
+  return (
+    <div style={{ position: "fixed", inset: 0, background: "rgba(0,0,0,0.25)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 9999 }}>
+      <div style={{ background: "#fff", borderRadius: 12, maxWidth: 720, width: "90%", padding: 16, boxShadow: "0 10px 30px rgba(0,0,0,0.2)" }}>
+        <h2 style={{ marginTop: 0 }}>Watchlist</h2>
+        <p style={{ color: "#6B7280", marginTop: 0 }}>
+          Paste one Ethereum/Base address per line (exact 0x…40 hex). We flag transfers where <b>From</b> or <b>To</b> matches.
+        </p>
+        <textarea
+          style={textarea}
+          value={local}
+          placeholder={sample}
+          onChange={(e) => setLocal(e.target.value)}
+        />
+        <div style={{ display: "flex", gap: 8, marginTop: 16, justifyContent: "flex-end" }}>
+          <button onClick={handleClear} style={{ padding: "10px 14px", borderRadius: 10, border: "1px solid #fecaca", background: "#fff5f5", color: "#991b1b", cursor: "pointer" }}>
+            Clear
+          </button>
+          <button onClick={onClose} style={{ padding: "10px 14px", borderRadius: 10, border: "1px solid #e5e7eb", background: "#fff", cursor: "pointer" }}>
+            Cancel
+          </button>
+          <button onClick={handleSave} style={{ padding: "10px 14px", borderRadius: 10, border: 0, background: "#111827", color: "#fff", cursor: "pointer", fontWeight: 600 }}>
+            Save & Apply
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+// ---------- CSV export ----------
+function toCsv(rows, opts = {}) {
+  const { includeFlags = true, watchlistSet = new Set() } = opts;
+  const esc = (s) => {
+    const v = String(s ?? "");
+    if (/[",\n]/.test(v)) return `"${v.replace(/"/g, '""')}"`;
+    return v;
+  };
+  const header = ["TimeUTC", "TxHash", "From", "To", "AmountUSDC", ...(includeFlags ? ["Flags"] : [])];
+  const lines = [header.join(",")];
+  for (const r of rows) {
+    const flags = [];
+    if (r.amount >= HIGH_VALUE_USD) flags.push("HighValue");
+    const isWL = watchlistSet.has((r.from || "").toLowerCase()) || watchlistSet.has((r.to || "").toLowerCase());
+    if (isWL) flags.push("Watchlist");
+    const line = [
+      esc(new Date(r.time).toISOString().replace("T", " ").slice(0, 19)),
+      esc(r.hash),
+      esc(r.from),
+      esc(r.to),
+      esc(r.amount),
+      ...(includeFlags ? [esc(flags.join("|"))] : []),
+    ].join(",");
+    lines.push(line);
+  }
+  return lines.join("\n");
+}
+
+function downloadCsv(filename, csvText) {
+  const blob = new Blob([csvText], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+
+// ---------- Main page ----------
 export default function Home() {
   const [settings, setSettings] = useState(() => loadLocal("cm_settings", { ...DEFAULTS }));
   const [rows, setRows] = useState([]);
@@ -129,12 +235,17 @@ export default function Home() {
   const [diag, setDiag] = useState("");
   const [openSettings, setOpenSettings] = useState(false);
 
+  // watchlist (client-side only)
+  const [watchlist, setWatchlist] = useState(() => loadLocal("cm_watchlist", []));
+  const watchlistSet = useMemo(() => new Set((watchlist || []).map((s) => s.toLowerCase())), [watchlist]);
+
+  // Scan logic (talks to /api/scan)
   async function scan({ reset = false } = {}) {
     setLoading(true);
     setErr("");
     setDiag("");
     try {
-      const cursorParam = !reset && nextCursorTo != null ? `&cursorTo=${String(nextCursorTo)}` : "";
+      const cursorParam = !reset && nextCursorTo != null ? `&cursorTo=${encodeURIComponent(String(nextCursorTo))}` : "";
       const qs =
         `window=${encodeURIComponent(String(settings.BLOCK_WINDOW))}` +
         `&target=${encodeURIComponent(String(settings.TARGET_ROWS))}` +
@@ -144,7 +255,7 @@ export default function Home() {
         `&retries=${encodeURIComponent(String(settings.MAX_RETRIES))}` +
         `&rdelay=${encodeURIComponent(String(settings.GENERIC_RETRY_DELAY_MS))}` +
         `&ratedelay=${encodeURIComponent(String(settings.RATE_LIMIT_DELAY_MS))}` +
-        `&maxms=${encodeURIComponent(String(Math.max(15000, settings.CLIENT_TIMEOUT_MS - 3000)))}` + // give server a little less than client cap
+        `&maxms=${encodeURIComponent(String(Math.max(15000, settings.CLIENT_TIMEOUT_MS - 3000)))}` +
         cursorParam;
 
       const controller = new AbortController();
@@ -157,14 +268,11 @@ export default function Home() {
         throw new Error(j?.error || `Scan failed with ${resp.status}`);
       }
       const data = await resp.json();
-
       setNextCursorTo(data.nextCursorTo ?? null);
       setDiag(
         `Fetched ${data.rows?.length ?? 0} rows; scanned ~${(data.scannedBlocks || 0).toLocaleString()} blocks. ` +
         (data.info?.partial ? "Partial (time-boxed)." : "Complete window.")
       );
-
-      // If reset, replace; else append
       setRows((prev) => (reset ? (data.rows || []) : [...prev, ...(data.rows || [])]));
     } catch (e) {
       setErr(String(e?.message || e));
@@ -177,6 +285,30 @@ export default function Home() {
 
   const hasData = useMemo(() => rows.length > 0, [rows]);
 
+  // Derive flagged rows (client-side flags)
+  const flaggedRows = useMemo(() => {
+    return rows.map((r) => {
+      const isWL =
+        watchlistSet.has((r.from || "").toLowerCase()) ||
+        watchlistSet.has((r.to || "").toLowerCase());
+      return {
+        ...r,
+        flaggedLarge: r.amount >= HIGH_VALUE_USD,
+        flaggedWatchlist: isWL,
+      };
+    });
+  }, [rows, watchlistSet]);
+
+  // Export current visible rows to CSV
+  function handleExportCsv() {
+    const csv = toCsv(flaggedRows, { includeFlags: true, watchlistSet });
+    const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    downloadCsv(`compliance-monitor_${ts}.csv`, csv);
+  }
+
+  // Modal toggles
+  const [openWatchlist, setOpenWatchlist] = useState(false);
+
   return (
     <div style={{ maxWidth: 980, margin: "40px auto", padding: 16, fontFamily: "ui-sans-serif, system-ui" }}>
       <h1 style={{ fontSize: 32, marginBottom: 8 }}>Stablecoin Compliance Monitor</h1>
@@ -184,6 +316,7 @@ export default function Home() {
         Live on-chain scan of recent <b>USDC</b> transfers on <b>Base</b>. Flags high-value (≥{HIGH_VALUE_USD.toLocaleString()}) and watchlist matches.
       </p>
 
+      {/* Controls */}
       <div style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
         <button onClick={() => setOpenSettings(true)} style={{ padding: "10px 14px", borderRadius: 10, border: "1px solid #e5e7eb", background: "#fff", cursor: "pointer" }}>
           ⚙️ Settings
@@ -194,7 +327,23 @@ export default function Home() {
         <button onClick={() => scan({ reset: false })} disabled={loading || nextCursorTo == null} style={{ padding: "10px 14px", borderRadius: 10, border: "1px solid #e5e7eb", background: "#fff", cursor: nextCursorTo == null ? "not-allowed" : "pointer" }}>
           Load more (older)
         </button>
+        <button onClick={() => setOpenWatchlist(true)} style={{ padding: "10px 14px", borderRadius: 10, border: "1px solid #e5e7eb", background: "#fff", cursor: "pointer" }}>
+          👁️ Watchlist
+        </button>
+        <button onClick={handleExportCsv} disabled={!hasData} style={{ padding: "10px 14px", borderRadius: 10, border: 0, background: hasData ? "#0f766e" : "#94a3b8", color: "#fff", cursor: hasData ? "pointer" : "not-allowed", fontWeight: 600 }}>
+          ⬇️ Export CSV
+        </button>
       </div>
+
+      {watchlist.length > 0 ? (
+        <div style={{ marginBottom: 12, color: "#374151", fontSize: 14 }}>
+          <b>Watchlist:</b> {watchlist.map((a) => a.slice(0, 8) + "…" + a.slice(-6)).join(", ")}
+        </div>
+      ) : (
+        <div style={{ marginBottom: 12, color: "#6b7280", fontSize: 14 }}>
+          No watchlist set. Click <b>👁️ Watchlist</b> to add addresses to monitor.
+        </div>
+      )}
 
       {err ? (
         <div style={{ padding: 12, background: "#FEF2F2", color: "#991B1B", border: "1px solid #FECACA", borderRadius: 8, marginBottom: 12, whiteSpace: "pre-wrap" }}>
@@ -225,7 +374,7 @@ export default function Home() {
             </thead>
             <tbody>
               {hasData ? (
-                rows.map((tx, i) => (
+                flaggedRows.map((tx, i) => (
                   <tr key={`${tx.hash}-${i}`} style={{ borderBottom: "1px solid #f1f5f9" }}>
                     <td style={{ padding: 8 }}>
                       {new Date(tx.time).toISOString().replace("T", " ").slice(0, 19)}
@@ -239,8 +388,14 @@ export default function Home() {
                     <td style={{ padding: 8 }}>{tx.to.slice(0, 10)}…</td>
                     <td style={{ padding: 8 }}>{tx.amount.toLocaleString()}</td>
                     <td style={{ padding: 8 }}>
-                      {tx.amount >= HIGH_VALUE_USD ? (
+                      {tx.flaggedLarge ? (
                         <span style={{ color: "#b91c1c", fontWeight: 700 }}>High&nbsp;Value&nbsp;</span>
+                      ) : null}
+                      {tx.flaggedWatchlist ? (
+                        <span style={{ color: "#b45309", fontWeight: 700 }}>Watchlist</span>
+                      ) : null}
+                      {!tx.flaggedLarge && !tx.flaggedWatchlist ? (
+                        <span style={{ color: "#6b7280" }}>—</span>
                       ) : null}
                     </td>
                   </tr>
@@ -262,12 +417,20 @@ export default function Home() {
         Demo only. For production compliance, add vetted lists, case management, and audit trails.
       </small>
 
+      {/* Modals */}
       <Settings
         open={openSettings}
         onClose={() => setOpenSettings(false)}
         settings={settings}
         setSettings={setSettings}
         onApply={scan}
+      />
+      <WatchlistEditor
+        open={openWatchlist}
+        onClose={() => setOpenWatchlist(false)}
+        watchlist={watchlist}
+        setWatchlist={setWatchlist}
+        onApply={() => { /* no re-scan necessary; flags update immediately */ }}
       />
     </div>
   );

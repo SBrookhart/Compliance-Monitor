@@ -4,15 +4,15 @@ const HIGH_VALUE_USD = 10000;
 
 // UI defaults — tweak live in Settings (saved to your browser)
 const DEFAULTS = {
-  BLOCK_WINDOW: 1200,     // blocks per call (~40–45 min on Base)
-  TARGET_ROWS: 50,        // stop early when we have this many rows
-  CHUNK_SIZE: 300,        // blocks per getLogs
-  CHUNK_DELAY_MS: 300,    // pause between log chunks
-  BLOCK_TS_DELAY_MS: 150, // pause between block timestamp lookups
+  BLOCK_WINDOW: 1200,
+  TARGET_ROWS: 50,
+  CHUNK_SIZE: 300,
+  CHUNK_DELAY_MS: 300,
+  BLOCK_TS_DELAY_MS: 150,
   MAX_RETRIES: 3,
   GENERIC_RETRY_DELAY_MS: 1200,
   RATE_LIMIT_DELAY_MS: 11000,
-  CLIENT_TIMEOUT_MS: 120000, // 120s browser timeout
+  CLIENT_TIMEOUT_MS: 120000,
 };
 
 // ---------- helpers ----------
@@ -147,7 +147,7 @@ function WatchlistEditor({ open, onClose, watchlist, setWatchlist, onApply }) {
     const unique = Array.from(new Set(lines));
     saveLocal("cm_watchlist", unique);
     setWatchlist(unique);
-    onApply(); // flags update immediately
+    onApply();
     onClose();
   }
 
@@ -195,7 +195,7 @@ function toCsv(rows, opts = {}) {
     if (/[",\n]/.test(v)) return `"${v.replace(/"/g, '""')}"`;
     return v;
   };
-  const header = ["TimeUTC", "TxHash", "From", "To", "AmountUSDC", "RiskScore", ...(includeFlags ? ["Flags"] : [])];
+  const header = ["TimeUTC", "TxHash", "From", "To", "AmountUSDC", "Block", "RiskScore", ...(includeFlags ? ["Flags"] : [])];
   const lines = [header.join(",")];
   for (const r of rows) {
     const flags = [];
@@ -207,6 +207,7 @@ function toCsv(rows, opts = {}) {
       esc(r.from),
       esc(r.to),
       esc(r.amount),
+      esc(r.blockNumber ?? ""),
       esc(r.riskScore),
       ...(includeFlags ? [esc(flags.join("|"))] : []),
     ].join(",");
@@ -232,10 +233,11 @@ function downloadCsv(filename, csvText) {
  * Rule-based Risk Score (0–100)
  * +40 if amount >= HIGH_VALUE_USD
  * +25 if watchlist hit (from or to)
- * +15 if "velocity" burst: same address appears in >=3 transfers within last 10 minutes of this slice
+ * +15 if "velocity" burst: either party appears in >=3 transfers within last 10 minutes of this slice
+ * +20 if block-local burst: either party appears in >5 transfers within the last 10 blocks (including current)
  * Score is clamped to 100
  */
-function computeRisk(tx, { watchlistSet, recentCounts }) {
+function computeRisk(tx, { watchlistSet, recentCounts, blockIndex }) {
   let score = 0;
   if (tx.amount >= HIGH_VALUE_USD) score += 40;
 
@@ -243,18 +245,27 @@ function computeRisk(tx, { watchlistSet, recentCounts }) {
   const toWL = watchlistSet.has((tx.to || "").toLowerCase());
   if (fromWL || toWL) score += 25;
 
-  const tenMinAgo = Date.now() - 10 * 60 * 1000;
   const burst = (recentCounts.get((tx.from || "").toLowerCase()) ?? 0)
-             + (recentCounts.get((tx.to || "").toLowerCase()) ?? 0);
-  // Only count "recent" rows; recentCounts already built with time filter
+              + (recentCounts.get((tx.to || "").toLowerCase()) ?? 0);
   if (burst >= 3) score += 15;
+
+  // +20 if >5 transfers in last 10 blocks by either party (including this tx's block)
+  const bn = Number(tx.blockNumber ?? 0);
+  if (bn > 0) {
+    const windowLo = bn - 9;
+    const fromBlocks = blockIndex.get((tx.from || "").toLowerCase()) || [];
+    const toBlocks   = blockIndex.get((tx.to || "").toLowerCase()) || [];
+    const countInWindow = (arr) => arr.reduce((acc, b) => (b >= windowLo && b <= bn ? acc + 1 : acc), 0);
+    const total = countInWindow(fromBlocks) + countInWindow(toBlocks);
+    if (total > 5) score += 20;
+  }
 
   return clamp(score, 0, 100);
 }
 
 /** Build a quick map of recent appearances per address (last 10 minutes) */
 function buildRecentCounts(rows) {
-  const cutoff = Date.now() - 10 * 60 * 1000; // 10 minutes
+  const cutoff = Date.now() - 10 * 60 * 1000;
   const m = new Map();
   for (const r of rows) {
     if ((r.time ?? 0) < cutoff) continue;
@@ -266,11 +277,38 @@ function buildRecentCounts(rows) {
   return m;
 }
 
+/** Build index: address -> array of blockNumbers seen in current slice */
+function buildBlockIndex(rows) {
+  const idx = new Map();
+  for (const r of rows) {
+    const f = (r.from || "").toLowerCase();
+    const t = (r.to || "").toLowerCase();
+    const bn = Number(r.blockNumber ?? 0);
+    if (!bn) continue;
+    if (f) {
+      const arr = idx.get(f) || [];
+      arr.push(bn);
+      idx.set(f, arr);
+    }
+    if (t) {
+      const arr = idx.get(t) || [];
+      arr.push(bn);
+      idx.set(t, arr);
+    }
+  }
+  // sort each array ascending for predictable behavior (optional)
+  for (const [k, arr] of idx) {
+    arr.sort((a, b) => a - b);
+    idx.set(k, arr);
+  }
+  return idx;
+}
+
 /** Map a risk score into a color + label */
 function riskBucket(score) {
-  if (score >= 51) return { label: "High", bg: "#fee2e2", text: "#991b1b", border: "#fecaca" };     // red-ish
-  if (score >= 21) return { label: "Medium", bg: "#fef3c7", text: "#92400e", border: "#fde68a" };  // amber-ish
-  return { label: "Low", bg: "#ecfdf5", text: "#065f46", border: "#a7f3d0" };                      // green-ish
+  if (score >= 51) return { label: "High", bg: "#fee2e2", text: "#991b1b", border: "#fecaca" };
+  if (score >= 21) return { label: "Medium", bg: "#fef3c7", text: "#92400e", border: "#fde68a" };
+  return { label: "Low", bg: "#ecfdf5", text: "#065f46", border: "#a7f3d0" };
 }
 
 // ---------- Main page ----------
@@ -283,11 +321,9 @@ export default function Home() {
   const [diag, setDiag] = useState("");
   const [openSettings, setOpenSettings] = useState(false);
 
-  // watchlist (client-side only)
   const [watchlist, setWatchlist] = useState(() => loadLocal("cm_watchlist", []));
   const watchlistSet = useMemo(() => new Set((watchlist || []).map((s) => s.toLowerCase())), [watchlist]);
 
-  // Scan logic (talks to /api/scan)
   async function scan({ reset = false } = {}) {
     setLoading(true);
     setErr("");
@@ -329,12 +365,13 @@ export default function Home() {
     }
   }
 
-  useEffect(() => { scan({ reset: true }); /* on first load */ }, []); // eslint-disable-line
+  useEffect(() => { scan({ reset: true }); }, []); // eslint-disable-line
 
   const hasData = useMemo(() => rows.length > 0, [rows]);
 
-  // Build recent address counts (10-minute window) for velocity heuristic
+  // Indexes for heuristics
   const recentCounts = useMemo(() => buildRecentCounts(rows), [rows]);
+  const blockIndex = useMemo(() => buildBlockIndex(rows), [rows]);
 
   // Derive flags + risk scores
   const enrichedRows = useMemo(() => {
@@ -343,22 +380,20 @@ export default function Home() {
       const flaggedWatchlist =
         watchlistSet.has((r.from || "").toLowerCase()) ||
         watchlistSet.has((r.to || "").toLowerCase());
-      const riskScore = computeRisk(r, { watchlistSet, recentCounts });
+      const riskScore = computeRisk(r, { watchlistSet, recentCounts, blockIndex });
       return { ...r, flaggedLarge, flaggedWatchlist, riskScore };
     });
-  }, [rows, watchlistSet, recentCounts]);
+  }, [rows, watchlistSet, recentCounts, blockIndex]);
 
-  // Export current visible rows (enriched) to CSV
+  // Export CSV
   function handleExportCsv() {
     const csv = toCsv(enrichedRows, { includeFlags: true });
     const ts = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
     downloadCsv(`compliance-monitor_${ts}.csv`, csv);
   }
 
-  // Modals
   const [openWatchlist, setOpenWatchlist] = useState(false);
 
-  // Legend styles
   const legendBadge = (bg, text, border) => ({
     display: "inline-block",
     padding: "4px 8px",
@@ -374,9 +409,23 @@ export default function Home() {
   return (
     <div style={{ maxWidth: 980, margin: "40px auto", padding: 16, fontFamily: "ui-sans-serif, system-ui" }}>
       <h1 style={{ fontSize: 32, marginBottom: 8 }}>Stablecoin Compliance Monitor</h1>
-      <p style={{ color: "#6b7280", marginBottom: 16 }}>
-        Live on-chain scan of recent <b>USDC</b> transfers on <b>Base</b>. Flags high-value (≥{HIGH_VALUE_USD.toLocaleString()}), watchlist matches, and now assigns a rule-based <b>Risk Score</b>.
+      <p style={{ color: "#6b7280", marginBottom: 8 }}>
+        Live on-chain scan of recent <b>USDC</b> transfers on <b>Base</b>. Flags high-value, watchlist matches, and assigns a rule-based <b>Risk Score</b>.
       </p>
+
+      {/* Overview box (brief what/why/how) */}
+      <div style={{ padding: 12, border: "1px solid #e5e7eb", borderRadius: 10, marginBottom: 12, background: "#f8fafc" }}>
+        <div style={{ fontWeight: 700, marginBottom: 6 }}>Overview</div>
+        <div style={{ fontSize: 14, color: "#374151" }}>
+          This dashboard scans recent blocks for USDC transfers on Base, highlights potential red flags, and helps you triage activity fast:
+          <ul style={{ margin: "6px 0 0 18px" }}>
+            <li>Find high-value transfers (≥ {HIGH_VALUE_USD.toLocaleString()} USDC)</li>
+            <li>Spot watchlist matches (you control the list)</li>
+            <li>Score and color-code transactions by simple, explainable behavior rules</li>
+            <li>Click a tx hash to open it on BaseScan; export current results to CSV</li>
+          </ul>
+        </div>
+      </div>
 
       {/* Controls */}
       <div style={{ display: "flex", gap: 8, marginBottom: 12, flexWrap: "wrap" }}>
@@ -401,7 +450,7 @@ export default function Home() {
       <div style={{ padding: 12, border: "1px solid #e5e7eb", borderRadius: 10, marginBottom: 12, background: "#fafafa" }}>
         <div style={{ fontWeight: 700, marginBottom: 6 }}>Risk Score (0–100)</div>
         <div style={{ marginBottom: 8, fontSize: 14, color: "#374151" }}>
-          +40 High value (≥{HIGH_VALUE_USD.toLocaleString()} USDC) · +25 Watchlist hit · +15 Velocity burst (≥3 appearances by either party in last 10 minutes)
+          +40 High value (≥{HIGH_VALUE_USD.toLocaleString()} USDC) · +25 Watchlist hit · +15 Velocity (≥3 in last 10 min) · <b>+20 Block burst (>5 in last 10 blocks)</b>
         </div>
         <div>
           <span style={legendBadge("#fee2e2", "#991b1b", "#fecaca")}>High (≥51)</span>
@@ -410,6 +459,7 @@ export default function Home() {
         </div>
       </div>
 
+      {/* Watchlist summary */}
       {watchlist.length > 0 ? (
         <div style={{ marginBottom: 12, color: "#374151", fontSize: 14 }}>
           <b>Watchlist:</b> {watchlist.map((a) => a.slice(0, 8) + "…" + a.slice(-6)).join(", ")}
@@ -445,6 +495,7 @@ export default function Home() {
                 <th style={{ padding: 8 }}>From</th>
                 <th style={{ padding: 8 }}>To</th>
                 <th style={{ padding: 8 }}>Amount (USDC)</th>
+                <th style={{ padding: 8 }}>Block</th>
                 <th style={{ padding: 8 }}>Flags</th>
                 <th style={{ padding: 8 }}>Risk</th>
               </tr>
@@ -466,6 +517,7 @@ export default function Home() {
                       <td style={{ padding: 8 }}>{tx.from.slice(0, 10)}…</td>
                       <td style={{ padding: 8 }}>{tx.to.slice(0, 10)}…</td>
                       <td style={{ padding: 8 }}>{tx.amount.toLocaleString()}</td>
+                      <td style={{ padding: 8 }}>{tx.blockNumber ?? ""}</td>
                       <td style={{ padding: 8 }}>
                         {tx.flaggedLarge ? (
                           <span style={{ color: "#b91c1c", fontWeight: 700, marginRight: 8 }}>High&nbsp;Value</span>
@@ -494,7 +546,7 @@ export default function Home() {
                 })
               ) : (
                 <tr>
-                  <td colSpan={7} style={{ padding: 12, color: "#6b7280" }}>
+                  <td colSpan={8} style={{ padding: 12, color: "#6b7280" }}>
                     No transfers returned in this slice. Use ⚙️ Settings to widen the window or “Load more (older)”.
                   </td>
                 </tr>

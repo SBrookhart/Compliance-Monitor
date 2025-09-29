@@ -296,7 +296,6 @@ function buildBlockIndex(rows) {
       idx.set(t, arr);
     }
   }
-  // sort each array ascending for predictable behavior (optional)
   for (const [k, arr] of idx) {
     arr.sort((a, b) => a - b);
     idx.set(k, arr);
@@ -450,7 +449,10 @@ export default function Home() {
       <div style={{ padding: 12, border: "1px solid #e5e7eb", borderRadius: 10, marginBottom: 12, background: "#fafafa" }}>
         <div style={{ fontWeight: 700, marginBottom: 6 }}>Risk Score (0–100)</div>
         <div style={{ marginBottom: 8, fontSize: 14, color: "#374151" }}>
-          +40 High value (≥{HIGH_VALUE_USD.toLocaleString()} USDC) · +25 Watchlist hit · +15 Velocity (≥3 in last 10 min) · <b>+20 Block burst (>5 in last 10 blocks)</b>
+          <span>
+            +40 High value (≥{HIGH_VALUE_USD.toLocaleString()} USDC) · +25 Watchlist hit · +15 Velocity (≥3 in last 10 min) ·{" "}
+          </span>
+          <strong>+20 Block burst (&gt;5 in last 10 blocks)</strong>
         </div>
         <div>
           <span style={legendBadge("#fee2e2", "#991b1b", "#fecaca")}>High (≥51)</span>

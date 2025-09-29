@@ -13,107 +13,180 @@ const USDC_CONTRACT = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"; // USDC on B
 const USDC_DECIMALS = 6;
 const HIGH_VALUE_USD = 10000; // flag threshold
 const WATCHLIST = [
-  // Put full 0x addresses you want to monitor
   "0x1111111111111111111111111111111111111111",
   "0x2222222222222222222222222222222222222222",
 ];
-// Base ~2s blocks → 3600 blocks ≈ ~2 hours. Increase for a wider window.
+// History window: Base ~2s blocks → 3600 ≈ ~2 hours
 const BLOCK_WINDOW = 3600;
 
-// Some RPCs limit eth_getLogs range. Keep chunks small to avoid errors.
-// If you still see "Block range is too large", reduce CHUNK_SIZE further (e.g., 500).
-const CHUNK_SIZE = 800;
+// Provider limits: keep chunks modest to avoid "block range too large"
+const CHUNK_SIZE = 600;
+
+// Throttle between chunk calls (ms) to avoid 429s
+const CHUNK_DELAY_MS = 250;
+
+// Throttle between per-block timestamp requests (ms)
+const BLOCK_TS_DELAY_MS = 120;
+
+// Retry/backoff settings
+const MAX_RETRIES = 3;
+const GENERIC_RETRY_DELAY_MS = 1500; // for transient errors
+const RATE_LIMIT_DELAY_MS = 11000;   // provider says "retry in 10s" → wait 11s
 // ==================================
 
-// Your Ankr RPC URL comes from Vercel env:
+// Primary + optional fallback RPCs via Vercel env
 // NEXT_PUBLIC_ANKR_BASE_RPC = https://rpc.ankr.com/base/<YOUR_KEY>
-const ANKR_RPC = process.env.NEXT_PUBLIC_ANKR_BASE_RPC;
+// NEXT_PUBLIC_FALLBACK_BASE_RPC = https://developer-access-mainnet.base.org
+const PRIMARY_RPC = process.env.NEXT_PUBLIC_ANKR_BASE_RPC;
+const FALLBACK_RPC = process.env.NEXT_PUBLIC_FALLBACK_BASE_RPC;
 
-// Build a client lazily so we can show nice errors if env var is missing
-function getClient() {
-  if (!ANKR_RPC || !/^https?:\/\//i.test(ANKR_RPC)) {
-    throw new Error(
-      "Missing NEXT_PUBLIC_ANKR_BASE_RPC. In Vercel, set it to your Ankr URL (e.g., https://rpc.ankr.com/base/XXXX)."
-    );
-  }
+function makeClient(url) {
+  if (!url || !/^https?:\/\//i.test(url)) return null;
   return createPublicClient({
     chain: base,
-    transport: http(ANKR_RPC, { batch: true }),
+    // Disable viem's http batching to avoid bundling multiple calls into one burst
+    transport: http(url, { batch: false }),
   });
 }
+
+const clients = [makeClient(PRIMARY_RPC), makeClient(FALLBACK_RPC)].filter(Boolean);
 
 // ERC-20 Transfer event signature
 const TRANSFER_EVENT = parseAbiItem(
   "event Transfer(address indexed from, address indexed to, uint256 value)"
 );
 
-/**
- * Fetch logs in small chunks to satisfy provider limits.
- * Returns an array of viem log objects.
- */
-async function getLogsChunked({ client, address, event, fromBlock, toBlock }) {
-  const logs = [];
-  // Guard: if from > to (weird clock skew), swap
+// ---- Utility helpers ----
+function sleep(ms) {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function isRateLimitError(e) {
+  const msg = String(e?.message || e).toLowerCase();
+  return (
+    msg.includes("too many requests") ||
+    msg.includes("rate limit") ||
+    msg.includes("exhausted")
+  );
+}
+
+async function withRetry(fn, { label = "rpc", retries = MAX_RETRIES } = {}) {
+  let lastErr;
+  for (let i = 0; i <= retries; i++) {
+    try {
+      return await fn();
+    } catch (e) {
+      lastErr = e;
+      const is429 = isRateLimitError(e);
+      const delay = is429 ? RATE_LIMIT_DELAY_MS : GENERIC_RETRY_DELAY_MS;
+      // On final attempt, break
+      if (i === retries) break;
+      // Wait, then retry
+      // eslint-disable-next-line no-console
+      console.warn(`[${label}] attempt ${i + 1} failed: ${e?.message || e}. Retrying in ${Math.round(delay/1000)}s…`);
+      await sleep(delay);
+    }
+  }
+  throw lastErr;
+}
+
+// Try each client in order (primary → fallback) with per-client retries
+async function withClient(fn, { label }) {
+  if (clients.length === 0) {
+    throw new Error(
+      "No RPC configured. Set NEXT_PUBLIC_ANKR_BASE_RPC (and optional NEXT_PUBLIC_FALLBACK_BASE_RPC) in Vercel."
+    );
+  }
+
+  let lastErr;
+  for (let idx = 0; idx < clients.length; idx++) {
+    const c = clients[idx];
+    try {
+      return await withRetry(() => fn(c), { label });
+    } catch (e) {
+      lastErr = e;
+      // eslint-disable-next-line no-console
+      console.warn(`[${label}] client ${idx + 1} failed: ${e?.message || e}`);
+      // If not last client, try next after a short pause
+      if (idx < clients.length - 1) await sleep(1000);
+    }
+  }
+  throw lastErr;
+}
+
+// ---- Core fetchers ----
+
+// Fetch logs in small chunks to satisfy provider limits and avoid 429s
+async function getLogsChunked({ address, event, fromBlock, toBlock }) {
+  const all = [];
   let start = fromBlock < toBlock ? fromBlock : toBlock;
   let end = toBlock > fromBlock ? toBlock : fromBlock;
-
   const step = BigInt(CHUNK_SIZE);
   let cursor = start;
 
   while (cursor <= end) {
     const chunkFrom = cursor;
-    // inclusive range; subtract 1 then add 1 is messy—keep inclusive and clamp.
-    const next = cursor + step - 1n;
-    const chunkTo = next > end ? end : next;
+    const chunkTo = (() => {
+      const next = cursor + step - 1n;
+      return next > end ? end : next;
+    })();
 
-    // Call provider for this chunk
-    // If provider still complains, reduce CHUNK_SIZE above.
-    const part = await client.getLogs({
-      address,
-      event,
-      fromBlock: chunkFrom,
-      toBlock: chunkTo,
-    });
+    const part = await withClient(
+      (client) =>
+        client.getLogs({
+          address,
+          event,
+          fromBlock: chunkFrom,
+          toBlock: chunkTo,
+        }),
+      { label: `getLogs ${chunkFrom}-${chunkTo}` }
+    );
 
-    if (part.length) logs.push(...part);
-
-    // Move to next block after this chunk
+    if (part.length) all.push(...part);
     cursor = chunkTo + 1n;
+
+    // Gentle pacing between chunks
+    await sleep(CHUNK_DELAY_MS);
   }
 
-  return logs;
+  return all;
 }
 
 async function fetchRecentTransfers() {
-  const client = getClient();
+  // Determine range
+  const latest = await withClient((client) => client.getBlockNumber(), {
+    label: "getBlockNumber",
+  });
 
-  // 1) Figure out the recent block range
-  const latest = await client.getBlockNumber();
   const fromBlock =
     latest > BigInt(BLOCK_WINDOW) ? latest - BigInt(BLOCK_WINDOW) : 0n;
 
-  // 2) Get Transfer logs for USDC in that range (chunked to avoid provider limits)
+  // Logs (chunked)
   const logs = await getLogsChunked({
-    client,
     address: getAddress(USDC_CONTRACT),
     event: TRANSFER_EVENT,
     fromBlock,
     toBlock: latest,
   });
 
-  if (!logs.length) return { rows: [], scannedBlocks: Number(latest - fromBlock) };
+  if (!logs.length) {
+    return { rows: [], scannedBlocks: Number(latest - fromBlock) };
+  }
 
-  // 3) Fetch timestamps for unique blocks (batch by block hash)
+  // Unique block hashes → timestamps (serial with gentle pacing to avoid 429)
   const uniqueBlocks = [...new Set(logs.map((l) => l.blockHash))];
   const blockMap = new Map();
-  await Promise.all(
-    uniqueBlocks.map(async (bh) => {
-      const block = await client.getBlock({ blockHash: bh });
-      blockMap.set(bh, Number(block.timestamp) * 1000); // ms
-    })
-  );
 
-  // 4) Shape rows
+  for (const bh of uniqueBlocks) {
+    const block = await withClient(
+      (client) => client.getBlock({ blockHash: bh }),
+      { label: "getBlock" }
+    );
+    blockMap.set(bh, Number(block.timestamp) * 1000);
+    await sleep(BLOCK_TS_DELAY_MS);
+  }
+
+  // Shape rows
   const wl = WATCHLIST.map((a) => a.toLowerCase());
   const rows = logs.map((l) => {
     const from = l.args.from;
@@ -139,6 +212,8 @@ async function fetchRecentTransfers() {
   return { rows, scannedBlocks: Number(latest - fromBlock) };
 }
 
+// ---- Page component ----
+
 export default function Home() {
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -151,25 +226,34 @@ export default function Home() {
       setErr("");
       setDiag("");
       try {
-        // Soft timeout guard (if your RPC is unreachable)
+        if (!PRIMARY_RPC) {
+          throw new Error(
+            "Missing NEXT_PUBLIC_ANKR_BASE_RPC. Set it in Vercel to your Ankr URL (e.g., https://rpc.ankr.com/base/XXXX)."
+          );
+        }
         const timeout = new Promise((_, rej) =>
-          setTimeout(() => rej(new Error("RPC timeout after 20s")), 20000)
+          setTimeout(() => rej(new Error("RPC timeout after 45s")), 45000)
         );
         const { rows: data, scannedBlocks } = await Promise.race([
           fetchRecentTransfers(),
           timeout,
         ]);
         setRows(data);
+        const which = clients
+          .map((c, i) => (i === 0 ? "primary" : "fallback"))
+          .join("→");
         setDiag(
-          `Scanned ~${scannedBlocks.toLocaleString()} blocks on Base (chunks of ${CHUNK_SIZE}).`
+          `Scanned ~${scannedBlocks.toLocaleString()} blocks on Base (chunks of ${CHUNK_SIZE}); clients: ${which}.`
         );
       } catch (e) {
         console.error("RPC error:", e);
         setErr(
           String(e?.message || e) +
-            (ANKR_RPC
+            (!PRIMARY_RPC
+              ? " | Hint: set NEXT_PUBLIC_ANKR_BASE_RPC in Vercel."
+              : FALLBACK_RPC
               ? ""
-              : " | Hint: set NEXT_PUBLIC_ANKR_BASE_RPC in Vercel to your Ankr URL.")
+              : " | Optional: set NEXT_PUBLIC_FALLBACK_BASE_RPC for failover.")
         );
       } finally {
         setLoading(false);
@@ -292,9 +376,9 @@ export default function Home() {
               ) : (
                 <tr>
                   <td colSpan={6} style={{ padding: 12, color: "#6b7280" }}>
-                    No transfers in the scanned window. Try widening it (increase
-                    BLOCK_WINDOW) or reduce CHUNK_SIZE if your provider limits
-                    ranges further.
+                    No transfers in the scanned window. Try widening it
+                    (increase BLOCK_WINDOW) or lower CHUNK_SIZE to be extra
+                    gentle with your provider.
                   </td>
                 </tr>
               )}
